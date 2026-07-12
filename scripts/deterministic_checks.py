@@ -1,0 +1,531 @@
+# -*- coding: utf-8 -*-
+"""
+deterministic_checks.py — 基于抽取产物产出"机器可验证"证据。
+
+读取 <run_dir>/ 下的 tables.json, captions.json, citations.json, numbers.json, fulltext.md
+以及 scripts/references_index.json，输出：
+  det_table.json      表格统计值核算（行/列合计、小计、平均、百分比、极值）
+  det_citations.json  标准/法规引用：格式、有效性、名称-编号一致性、前后一致性
+  det_numbers.json    std_001 大数单位混用 / std_003 流量有效数字 / std_004 等别级别数字
+  det_numbering.json  gram_007 图表编号顺序/格式
+
+证据供语义检查 subagent 引用，保证数值类、对照类检查的严谨与高效。
+设计原则：宁可漏报(留给语义判断)也不误报，避免污染校审结论的可信度。
+"""
+
+from __future__ import annotations
+import json
+import math
+import os
+import re
+import sys
+from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib_docx import norm_code, norm_name  # noqa: E402
+
+INDEX = None  # references_index.json
+
+
+# ---------------- 通用数值解析 ----------------
+def parse_cell(s):
+    """解析单元格：返回 (kind, value)。kind: 'num'|'pct'|'range'|'none'。"""
+    if s is None:
+        return ("none", None)
+    t = str(s).strip()
+    if t == "" or t in ("—", "-", "－", "/", "无", "略"):
+        return ("none", None)
+    is_pct = "%" in t
+    clean = re.sub(r"[,%‰]", "", t)
+    clean = re.sub(r"[a-zA-Z㎡m³²·/\s]", "", clean)
+    clean = clean.replace("，", "").replace("。", "")
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*[～\-~至到]\s*([0-9]+(?:\.[0-9]+)?)$", clean)
+    if m:
+        return ("range", (float(m.group(1)), float(m.group(2))))
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)$", clean)
+    if m:
+        return ("pct" if is_pct else "num", float(m.group(1)))
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)", clean)
+    if m:
+        return ("pct" if is_pct else "num", float(m.group(1)))
+    return ("none", None)
+
+
+def sig_figs(x: float):
+    s = ("%g" % x).replace("-", "").replace("e", ".").replace("E", ".")
+    digits = re.sub(r"[^0-9]", "", s)
+    return len(digits.lstrip("0"))
+
+
+_CLEAN_NUM_RE = re.compile(r"^[+-]?[0-9]+(?:\.[0-9]+)?%?$")
+
+
+def is_clean_num(cell):
+    """单元格是否为"纯数值"（可安全参与求和）。
+    排除 '1007/27'(kW/台双单位)、'0.50～0.65'(区间)、'17.9m'(带单位) 等。"""
+    if cell is None:
+        return False
+    t = str(cell).strip().replace(" ", "")
+    return bool(_CLEAN_NUM_RE.match(t))
+
+
+# ---------------- 表格统计核算 ----------------
+# 严格判定，避免把"最大24h降雨""经验频率"等术语误判为统计行/占比列。
+PCT_COMPOSITION_HDR = re.compile(r"(占比|比例|百分比|百分率|构成|所占|权重比)")
+PCT_EXCLUDE_HDR = re.compile(r"(频率|经验频率|重现期|保证率|累积|累计|概率|超过|超越|次频率)")
+
+
+def _row_label(grid, ri, ncols):
+    parts = []
+    for ci in range(min(2, ncols)):
+        v = grid[ri][ci] if ci < len(grid[ri]) else None
+        if v:
+            parts.append(str(v))
+    return "".join(parts).strip()
+
+
+def _row_role(label_text):
+    """行角色：total/subtotal/avg/max/min/data。要求标签基本等于关键词，避免误匹配。"""
+    t = label_text.replace(" ", "")
+    if len(t) > 12:
+        return "data"
+    if re.search(r"(合\s*计|总\s*计)", t) and not re.search(r"小\s*计", t):
+        return "total"
+    if re.search(r"小\s*计", t):
+        return "subtotal"
+    if re.search(r"(平\s*均|均\s*值|加权|多年平均|年平均)", t):
+        return "avg"
+    if re.match(r"^(最\s*大\s*值|最\s*大|最\s*高)", t):
+        return "max"
+    if re.match(r"^(最\s*小\s*值|最\s*小|最\s*低)", t):
+        return "min"
+    return "data"
+
+
+def check_tables(tables):
+    out = []
+    for tb in tables:
+        grid = tb["grid"]
+        nrows = tb["nrows"]; ncols = tb["ncols"]
+        if nrows < 2 or ncols < 2:
+            continue
+        mat, clean, roles = [], [], []
+        for ri, r in enumerate(grid):
+            row_v, row_c = [], []
+            for c in r:
+                k, v = parse_cell(c)
+                row_v.append(v if k in ("num", "pct") else None)
+                row_c.append(v if (is_clean_num(c) and k in ("num",)) else None)
+            mat.append(row_v); clean.append(row_c)
+            roles.append("header" if ri == 0 else _row_role(_row_label(grid, ri, ncols)))
+        header = grid[0] if grid else []
+
+        def near(a, b, rel=0.01, abs_=0.05):
+            if a is None or b is None:
+                return None
+            return abs(a - b) <= max(abs_, rel * max(abs(a), abs(b), 1e-9))
+
+        def hdr_str(ci):
+            return str(header[ci]) if ci < len(header) and header[ci] else ""
+
+        checks = []
+        data_rows = [ri for ri in range(1, nrows) if roles[ri] == "data"]
+        total_rows = [ri for ri in range(1, nrows) if roles[ri] == "total"]
+        multi_total_rows = len(total_rows) > 1
+        multi_total_cols = len([ci for ci in range(ncols)
+                                if re.search(r"(合\s*计|总\s*计)", hdr_str(ci))
+                                and not re.search(r"小\s*计", hdr_str(ci))]) > 1
+
+        def is_index_col(ci):
+            if re.search(r"(序号|编号|项次|项别|序次)", hdr_str(ci)):
+                return True
+            vals = [clean[rj][ci] for rj in data_rows if clean[rj][ci] is not None]
+            if len(vals) >= 4 and vals == list(range(1, len(vals) + 1)):
+                return True
+            return False
+
+        # ---- 行级：合计/总计/最大/最小 ----
+        for ri in range(1, nrows):
+            role = roles[ri]
+            data_cols = [ci for ci in range(ncols) if mat[ri][ci] is not None]
+            if role == "total":
+                for ci in data_cols:
+                    stated = clean[ri][ci]
+                    if stated is None:
+                        continue
+                    comp_cells = [clean[rj][ci] for rj in data_rows]
+                    if sum(1 for x in comp_cells if x is None) > 1:
+                        continue  # 非纯数值过多(如kW/台双单位)，跳过避免误判
+                    comp = sum(x for x in comp_cells if x is not None)
+                    ok = near(stated, comp, rel=0.01, abs_=0.5)
+                    if multi_total_rows:
+                        checks.append({"type": "行合计(信息-多合计行未定分组)",
+                                       "loc": f"R{ri}C{ci}", "stated": stated,
+                                       "computed": round(comp, 4), "status": "info",
+                                       "note": f"列='{hdr_str(ci)[:14]}' 供语义核查"})
+                    elif ok is False:
+                        checks.append({"type": "行合计", "loc": f"R{ri}C{ci}",
+                                       "stated": stated, "computed": round(comp, 4),
+                                       "status": "fail",
+                                       "note": f"列='{hdr_str(ci)[:14]}' 差额{stated - comp:+.2f}"})
+                    elif ok:
+                        checks.append({"type": "行合计", "loc": f"R{ri}C{ci}",
+                                       "stated": stated, "computed": round(comp, 4),
+                                       "status": "pass", "note": f"列='{hdr_str(ci)[:14]}'"})
+            elif role in ("max", "min"):
+                for ci in data_cols:
+                    stated = clean[ri][ci]
+                    if stated is None:
+                        continue
+                    col_vals = [clean[rj][ci] for rj in data_rows if clean[rj][ci] is not None]
+                    if len(col_vals) < 2:
+                        continue
+                    comp = max(col_vals) if role == "max" else min(col_vals)
+                    checks.append({"type": ("最大值" if role == "max" else "最小值") + "(信息)",
+                                   "loc": f"R{ri}C{ci}", "stated": stated, "computed": comp,
+                                   "status": "info",
+                                   "note": f"列='{hdr_str(ci)[:14]}' 供语义核查"})
+            elif role == "avg":
+                for ci in data_cols:
+                    stated = mat[ri][ci]
+                    col_vals = [mat[rj][ci] for rj in data_rows if mat[rj][ci] is not None]
+                    if not col_vals:
+                        continue
+                    comp = sum(col_vals) / len(col_vals)
+                    checks.append({"type": "行平均(信息)", "loc": f"R{ri}C{ci}",
+                                   "stated": stated, "computed": round(comp, 4),
+                                   "status": "info",
+                                   "note": f"列='{hdr_str(ci)[:14]}' 偏差{(stated - comp):+.2f}"})
+
+        # ---- 列级：表头含 合计/总计 ----
+        total_cols = [ci for ci in range(ncols)
+                      if re.search(r"(合\s*计|总\s*计)", hdr_str(ci)) and not re.search(r"小\s*计", hdr_str(ci))]
+        for ci in total_cols:
+            other_data = [cj for cj in range(ncols)
+                          if cj != ci and cj not in total_cols and not is_index_col(cj)]
+            for ri in data_rows:
+                stated = clean[ri][ci]
+                if stated is None:
+                    continue
+                vals = [clean[ri][cj] for cj in other_data if clean[ri][cj] is not None]
+                if not vals:
+                    continue
+                comp = sum(vals)
+                ok = near(stated, comp, rel=0.01, abs_=0.5)
+                if multi_total_cols:
+                    checks.append({"type": "列合计(信息-多合计列)", "loc": f"R{ri}C{ci}",
+                                   "stated": stated, "computed": round(comp, 4),
+                                   "status": "info", "note": "供语义核查"})
+                elif ok is False:
+                    checks.append({"type": "列合计", "loc": f"R{ri}C{ci}",
+                                   "stated": stated, "computed": round(comp, 4),
+                                   "status": "fail", "note": f"差额{stated - comp:+.2f}"})
+                elif ok:
+                    checks.append({"type": "列合计", "loc": f"R{ri}C{ci}",
+                                   "stated": stated, "computed": round(comp, 4),
+                                   "status": "pass"})
+
+        # ---- 占比/百分比列求和（仅构成类，排除频率类）----
+        for ci in range(ncols):
+            hdr = hdr_str(ci)
+            if PCT_EXCLUDE_HDR.search(hdr) or not PCT_COMPOSITION_HDR.search(hdr):
+                continue
+            cnt = sum(1 for ri in data_rows if mat[ri][ci] is not None)
+            if cnt < 3:
+                continue
+            vals = [mat[ri][ci] for ri in data_rows if mat[ri][ci] is not None]
+            s = sum(vals)
+            status = "pass" if abs(s - 100) <= 2 else ("warn" if abs(s - 100) <= 5 else "fail")
+            checks.append({"type": "百分比求和", "loc": f"C{ci} '{hdr[:14]}'",
+                           "stated": 100, "computed": round(s, 4),
+                           "status": status, "note": f"列共{cnt}个数值，合计{s:.2f}"})
+
+        if checks:
+            fails = [c for c in checks if c["status"] == "fail"]
+            warns = [c for c in checks if c["status"] == "warn"]
+            out.append({
+                "id": tb["id"], "pid": tb["pid"], "caption": tb["caption"],
+                "section": tb["section"], "nrows": nrows, "ncols": ncols,
+                "header": tb["header"][:8],
+                "n_checks": len(checks), "n_fail": len(fails), "n_warn": len(warns),
+                "checks": checks,
+            })
+    return out
+
+
+# ---------------- 引用检查 ----------------
+def check_citations(citations, index):
+    std_by_code = index["standards_by_code"]
+    std_by_name = index["standards_by_name"]
+    law_by_name = index["laws_by_name"]
+    prefix_idx = index["names_by_prefix_code"]
+
+    def prefix_num(nc):
+        return re.sub(r"-\d{4}$", "", nc)
+
+    results = []
+    for c in citations:
+        kind = c["kind"]
+        rec = {"kind": kind, "raw": c["raw"], "name": c.get("name", ""),
+               "para_idx": c["para_idx"], "section": c["section"],
+               "context": c.get("context", "")}
+        if kind == "std":
+            nc = c["norm_code"]
+            rec["norm_code"] = nc
+            if nc in std_by_code:
+                rec["validity"] = "valid"
+                rec["matched_code"] = nc
+            else:
+                cand = prefix_idx.get(prefix_num(nc))
+                if cand:
+                    rec["validity"] = "year_mismatch"
+                    rec["matched_code"] = cand[0]["编号"]
+                    rec["note"] = f"清单中该编号现行版本：{cand[0]['编号']}《{cand[0]['名称']}》(实施{cand[0]['实施日期']})"
+                else:
+                    rec["validity"] = "not_in_list"
+                    rec["note"] = "未在水利标准有效清单中，疑似已废止/编号有误/非水利行业"
+            nm = c.get("norm_name", "")
+            if nm:
+                if nm in std_by_name:
+                    name_idxs = set(std_by_name[nm])
+                    code_idxs = set(std_by_code.get(nc, []))
+                    # 仅当"名称对应序号"与"编号对应序号"完全不相交时才算名称-编号不一致
+                    if code_idxs and name_idxs.isdisjoint(code_idxs):
+                        rec["name_code_mismatch"] = True
+                        rec["note2"] = f"名称《{c.get('name')}》清单对应 {sorted(name_idxs)}，与编号 {nc}({sorted(code_idxs)}) 不一致"
+                else:
+                    rec["name_not_in_list"] = True
+                    rec["note2"] = f"名称《{c.get('name')}》未在标准清单中，可能名称有误"
+            fmt = []
+            if "—" in c["raw"] or "－" in c["raw"]:
+                fmt.append("破折号为全角(建议统一)")
+            if re.match(r"^(SL|GB|NB|DL|JTG|JTS|CJJ|DB)\d",
+                        c["raw"].upper().replace(" ", "")):
+                fmt.append("前缀与编号间无空格(格式)")
+            rec["format_issues"] = fmt
+            results.append(rec)
+        elif kind in ("law", "law_code"):
+            nm = c.get("norm_name", "")
+            rec["norm_name"] = nm
+            if nm and nm in law_by_name:
+                rec["validity"] = "valid"
+                rec["matched"] = law_by_name[nm]
+            elif nm:
+                rec["validity"] = "not_in_list"
+                rec["note"] = f"《{c.get('name')}》未在法律法规清单中"
+            else:
+                rec["validity"] = "code_only"
+            results.append(rec)
+        elif kind == "std_name_only":
+            nm = c.get("norm_name", "")
+            rec["norm_name"] = nm
+            if nm in std_by_name:
+                rec["validity"] = "valid_name"
+                rec["matched"] = std_by_name[nm]
+            else:
+                rec["validity"] = "not_in_list"
+                rec["note"] = f"《{c.get('name')}》未在水利标准清单中"
+            results.append(rec)
+
+    # ---- 一致性 ----
+    consistency = []
+    grp = defaultdict(set); grp_ctx = defaultdict(list)
+    for r in results:
+        if r.get("norm_code") and r.get("validity") in ("valid", "year_mismatch"):
+            pn = prefix_num(r["norm_code"])
+            grp[pn].add(r["raw"]); grp_ctx[pn].append(r)
+    for pn, raws in grp.items():
+        norms = set(norm_code(x) for x in raws)
+        if len(norms) > 1:
+            consistency.append({"type": "同一标准编号前后写法不一致", "key": pn,
+                                "variants": sorted(norms),
+                                "samples": [f"{r['raw']}({r['para_idx']})" for r in grp_ctx[pn][:6]]})
+    ngrp = defaultdict(set); nctx = defaultdict(list)
+    for r in results:
+        nm = r.get("norm_name") or r.get("name")
+        if nm and r.get("norm_code"):
+            ngrp[nm].add(prefix_num(r["norm_code"])); nctx[nm].append(r)
+    for nm, codes in ngrp.items():
+        if len(codes) > 1:
+            consistency.append({"type": "同一名称对应不同编号", "key": nm,
+                                "codes": sorted(codes),
+                                "samples": [f"{r['raw']}({r['para_idx']})" for r in nctx[nm][:6]]})
+
+    std_results = [r for r in results if r["kind"] == "std"]
+    law_results = [r for r in results if r["kind"] in ("law", "law_code", "std_name_only")
+                   and r["raw"].startswith("《")]
+    return {
+        "citations": results, "consistency": consistency,
+        "summary": {
+            "std_total": len(std_results),
+            "std_valid": sum(1 for r in std_results if r.get("validity") == "valid"),
+            "std_not_in_list": sum(1 for r in std_results if r.get("validity") == "not_in_list"),
+            "std_year_mismatch": sum(1 for r in std_results if r.get("validity") == "year_mismatch"),
+            "name_code_mismatch": sum(1 for r in results if r.get("name_code_mismatch")),
+            "name_not_in_list": sum(1 for r in results if r.get("name_not_in_list")),
+            "law_ref_total": len(law_results),
+            "law_not_in_list": sum(1 for r in law_results if r.get("validity") == "not_in_list"),
+            "consistency_issues": len(consistency),
+        }}
+
+
+# ---------------- 数值规范性 ----------------
+def _to_3sig(x):
+    if x == 0:
+        return "0"
+    d = 3 - int(math.floor(math.log10(abs(x)))) - 1
+    d = max(d, 0)
+    return ("%." + str(d) + "f") % round(x, d)
+
+
+def check_numbers(numbers, fulltext):
+    # std_003 流量有效数字（仅判 >3位有效数字 或 小数>3位 为硬违规）
+    flows = [n for n in numbers if n["key"] == "flows"]
+    flow_violations, flow_info = [], []
+    seen = set()
+    for n in flows:
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", n["raw"])
+        if not m:
+            continue
+        numstr = m.group(1)
+        if numstr in seen:
+            continue
+        seen.add(numstr)
+        try:
+            val = float(numstr)
+        except ValueError:
+            continue
+        decimals = len(numstr.split(".")[1]) if "." in numstr else 0
+        sf = sig_figs(val)
+        if sf > 3 or decimals > 3:
+            flow_violations.append({"value": numstr, "sig_figs": sf, "decimals": decimals,
+                                    "suggested": _to_3sig(val), "context": n["context"],
+                                    "para_idx": n["para_idx"]})
+        elif sf < 3 and "." not in numstr:
+            flow_info.append({"value": numstr, "sig_figs": sf, "context": n["context"],
+                              "para_idx": n["para_idx"], "note": "整数不足3位有效数字(设计流量常为整数,结合语境判断)"})
+
+    # std_001 大数单位：仅在"文字单位"与"10的N次方"两种形式混用时才算违规
+    bigunits = [n for n in numbers if n["key"] == "bigunits"]
+    pow10 = [n for n in numbers if n["key"] == "pow10"]
+    bu_count = defaultdict(int)
+    for n in bigunits:
+        m = re.search(r"(亿|万|百万)", n["raw"])
+        if m:
+            bu_count[m.group(1)] += 1
+    word_forms = {k: v for k, v in bu_count.items() if v > 0}
+    has_word = len(word_forms) > 0
+    has_pow10 = len(pow10) > 0
+    std001_mixed = has_word and has_pow10  # 同一报告只能用一种"形式"（文字 vs 10的次方）
+
+    return {
+        "std003_flow": {"violations": flow_violations, "info": flow_info,
+                        "n_violations": len(flow_violations)},
+        "std001_bigunit": {"word_forms": word_forms, "pow10_count": len(pow10),
+                           "mixed_form": std001_mixed,
+                           "note": "亿/百万/万属同一(文字)形式可并用；仅当与'10的N次方'混用时违规"},
+        "std004_grade": _check_grade(fulltext),
+    }
+
+
+def _check_grade(fulltext):
+    findings = []
+    for m in re.finditer(r"(枢纽工程|工程)等别[^，。；\n]{0,18}", fulltext):
+        seg = m.group(0)
+        has_roman = bool(re.search(r"[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]", seg))
+        arabic = re.findall(r"[1-7]", seg)
+        if arabic and not has_roman:
+            findings.append({"rule": "工程等别应为罗马数字(Ⅰ~Ⅴ)", "loc": seg,
+                             "issue": f"出现阿拉伯数字 {arabic}", "expect": "罗马数字"})
+        elif has_roman:
+            findings.append({"rule": "工程等别应为罗马数字", "loc": seg, "ok": True})
+    for m in re.finditer(r"(主要建筑物|次要建筑物|水工建筑物|建筑物)级别[^，。；\n]{0,12}", fulltext):
+        seg = m.group(0)
+        roman = re.findall(r"[ⅠⅡⅢⅣⅤⅥⅦ]", seg)
+        if roman:
+            findings.append({"rule": "建筑物级别应为阿拉伯数字(1~5)", "loc": seg,
+                             "issue": f"出现罗马数字 {roman}", "expect": "阿拉伯数字"})
+    return findings
+
+
+# ---------------- 图表编号 gram_007 ----------------
+def check_numbering(captions):
+    defs = [c for c in captions if c["is_def"]]
+    by_type = defaultdict(list)
+    for c in defs:
+        by_type[c["type"]].append(c)
+    result = {}
+    for t, items in by_type.items():
+        groups = defaultdict(list)
+        for c in items:
+            mm = re.match(r"^(.+?)[\-\.]([0-9]+)$", c["num"])
+            if not mm:
+                groups[c["num"]].append((0, c)); continue
+            groups[mm.group(1)].append((int(mm.group(2)), c))
+        issues = []
+        for prefix, lst in groups.items():
+            serials = sorted(set(s for s, _ in lst))
+            dups = [s for s in serials if sum(1 for x, _ in lst if x == s) > 1]
+            gaps = [(serials[i], serials[i + 1])
+                    for i in range(len(serials) - 1) if serials[i + 1] - serials[i] > 1]
+            if dups:
+                issues.append({"prefix": prefix, "type": "重复编号", "detail": f"重复序号 {dups}"})
+            if gaps:
+                issues.append({"prefix": prefix, "type": "编号间断",
+                               "detail": ", ".join(f"{a}->{b}" for a, b in gaps)})
+        formats = sorted(set(re.sub(r"\d", "#", c["num"]) for c in items))
+        format_inconsistent = len(formats) > 1
+        result[t] = {"count": len(items), "formats": formats,
+                     "format_inconsistent": format_inconsistent, "issues": issues,
+                     "by_prefix": {p: len(v) for p, v in groups.items()}}
+    return result
+
+
+def main():
+    args = sys.argv[1:]
+    run_dir = args[0] if len(args) > 0 else None
+    here = os.path.dirname(os.path.abspath(__file__))
+    skill_root = os.path.normpath(os.path.join(here, ".."))
+    if not run_dir:
+        rd = os.path.join(skill_root, "_run")
+        subs = [os.path.join(rd, x) for x in os.listdir(rd)] if os.path.isdir(rd) else []
+        subs = [s for s in subs if os.path.isdir(s)]
+        run_dir = max(subs, key=lambda p: os.path.getmtime(p)) if subs else None
+    if not run_dir or not os.path.isdir(run_dir):
+        print("用法: python deterministic_checks.py <run_dir>"); sys.exit(1)
+
+    global INDEX
+    INDEX = json.load(open(os.path.join(here, "references_index.json"), encoding="utf-8"))
+
+    tables = json.load(open(os.path.join(run_dir, "tables.json"), encoding="utf-8"))
+    captions = json.load(open(os.path.join(run_dir, "captions.json"), encoding="utf-8"))
+    citations = json.load(open(os.path.join(run_dir, "citations.json"), encoding="utf-8"))
+    numbers = json.load(open(os.path.join(run_dir, "numbers.json"), encoding="utf-8"))
+    fulltext = open(os.path.join(run_dir, "fulltext.md"), encoding="utf-8").read()
+
+    det_table = check_tables(tables)
+    det_cit = check_citations(citations, INDEX)
+    det_num = check_numbers(numbers, fulltext)
+    det_num7 = check_numbering(captions)
+
+    for name, data in (("det_table.json", det_table), ("det_citations.json", det_cit),
+                       ("det_numbers.json", det_num), ("det_numbering.json", det_num7)):
+        json.dump(data, open(os.path.join(run_dir, name), "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=1)
+
+    print("[deterministic_checks] 摘要：")
+    print(f"  表格核算：涉及 {len(det_table)} 张表，"
+          f"不合格 {sum(t['n_fail'] for t in det_table)} 项，存疑 {sum(t['n_warn'] for t in det_table)} 项")
+    print(f"  引用：{det_cit['summary']}")
+    print(f"  引用一致性问题：{det_cit['summary']['consistency_issues']} 组")
+    print(f"  流量有效数字(std_003) 违规 {det_num['std003_flow']['n_violations']} 处")
+    print(f"  大数单位(std_001) 文字单位={det_num['std001_bigunit']['word_forms']} "
+          f"10的次方={det_num['std001_bigunit']['pow10_count']} 混用={det_num['std001_bigunit']['mixed_form']}")
+    print(f"  等别/级别(std_004) 异常 {sum(1 for g in det_num['std004_grade'] if not g.get('ok'))} 处")
+    for t, r in det_num7.items():
+        print(f"  图表编号({t}) 共 {r['count']} 个题录，格式 {r['formats']}，"
+              f"格式不一致={r['format_inconsistent']}，序号问题 {len(r['issues'])} 组")
+
+
+if __name__ == "__main__":
+    main()

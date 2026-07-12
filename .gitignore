@@ -1,0 +1,13 @@
+# 生成产物：每次校审运行的结构化抽取与证据（含被审报告全文，勿提交）
+_run/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 由 references/*.md 自动生成的索引/要求（首次运行用 maintain.py --force 重建）
+scripts/references_index.json
+scripts/requirements.json
+
+# 备份
+*.bak
