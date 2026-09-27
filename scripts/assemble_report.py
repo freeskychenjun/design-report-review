@@ -132,6 +132,19 @@ def verdict_of(by_id, rid):
     return (res.get("verdict", "未检出") if res else "未检出"), res
 
 
+def _normalize_result_fields(r):
+    """类型安全：evidence 必须为 list；issues 必须为 list[dict]。"""
+    ev = r.get("evidence", [])
+    if isinstance(ev, str):
+        ev = []
+    r["evidence"] = ev
+    iss = r.get("issues", [])
+    if not isinstance(iss, list):
+        iss = []
+    r["issues"] = [i for i in iss if isinstance(i, dict)]
+    return r
+
+
 def load(run_dir, here):
     reqs = json.load(open(os.path.join(here, "requirements.json"), encoding="utf-8"))
     meta = json.load(open(os.path.join(run_dir, "meta.json"), encoding="utf-8"))
@@ -140,16 +153,28 @@ def load(run_dir, here):
     by_id = {}
     for grp in raw:
         for r in grp.get("results", []):
-            # 类型安全：evidence 必须为 list；issues 必须为 list[dict]
-            ev = r.get("evidence", [])
-            if isinstance(ev, str):
-                ev = []
-            r["evidence"] = ev
-            iss = r.get("issues", [])
-            if not isinstance(iss, list):
-                iss = []
-            r["issues"] = [i for i in iss if isinstance(i, dict)]
+            _normalize_result_fields(r)
             by_id[r["id"]] = r
+
+    # 双保险：det_findings.json 的同 id 结果覆盖 findings.json（det 优先）。
+    # 正常流程下 collect_findings 已合并，此处只在 collect 未跑或 findings 缺失时兜底。
+    det_fp = os.path.join(run_dir, "det_findings.json")
+    if os.path.exists(det_fp):
+        det_raw = json.load(open(det_fp, encoding="utf-8"))
+        n_det = 0
+        for grp in det_raw:
+            for r in grp.get("results", []):
+                _normalize_result_fields(r)
+                # 给 det 来源的条目在 conclusion 标注（机器判定），便于人工复核时识别
+                if r.get("_source") == "deterministic" or r["id"] in by_id:
+                    conc = r.get("conclusion", "")
+                    if "（机器判定）" not in conc:
+                        r["conclusion"] = conc + "　（机器判定）" if conc else "（机器判定）"
+                by_id[r["id"]] = r   # det 覆盖
+                n_det += 1
+        if n_det:
+            print(f"[assemble_report] det_findings 双保险并入 {n_det} 条（覆盖优先）")
+
     cats = OrderedDict()
     for r in reqs:
         cats.setdefault(r["category"], []).append(r)
@@ -163,7 +188,7 @@ def load(run_dir, here):
 # ============================================================
 # Markdown 渲染
 # ============================================================
-def render_markdown(reqs, by_id, meta, cats, doc_name, xform=None):
+def render_markdown(reqs, by_id, meta, cats, doc_name, xform=None, max_issues=30):
     xf = xform or (lambda t: t)
     lines = []
     lines.append(f"# 《{doc_name}》智能校审报告\n")
@@ -185,12 +210,14 @@ def render_markdown(reqs, by_id, meta, cats, doc_name, xform=None):
             issues = (res.get("issues") if res else None) or []
             if issues:
                 lines.append("**具体问题与建议**：")
-                for idx, it in enumerate(issues[:30], 1):
+                for idx, it in enumerate(issues[:max_issues], 1):
                     loc = xf(it.get("loc", ""))
                     org = fmt_md(xf(it.get("original", "")))
                     typ = xf(it.get("type", ""))
                     sug = fmt_md(xf(it.get("suggestion", "")))
                     lines.append(f"{idx}. `{loc}` 原文「{org}」【{typ}】→ 建议：{sug}")
+                if len(issues) > max_issues:
+                    lines.append(f"……（共 {len(issues)} 条，其余 {len(issues) - max_issues} 条未显示；可用 --max-issues 调大）")
                 lines.append("")
             if evidence:
                 lines.append("**依据**：")
@@ -229,7 +256,7 @@ body { font-family:"Microsoft YaHei","PingFang SC","Helvetica Neue",Arial,sans-s
 .header h1 { font-size:26px; font-weight:700; margin-bottom:6px; }
 .header .meta { font-size:13.5px; opacity:.9; margin-top:10px; }
 .header .meta span { margin-right:22px; display:inline-block; }
-.container { max-width:1240px; margin:0 auto; padding:24px 20px 60px; display:flex; gap:22px; }
+.container { max-width:none; margin:0; padding:24px 20px 60px 14px; display:flex; gap:20px; }
 .sidebar { width:230px; flex-shrink:0; position:sticky; top:18px;
            max-height:calc(100vh - 36px); overflow-y:auto; background:#fff;
            border-radius:12px; padding:14px; box-shadow:0 2px 12px rgba(0,0,0,.06); }
@@ -242,7 +269,7 @@ body { font-family:"Microsoft YaHei","PingFang SC","Helvetica Neue",Arial,sans-s
                    overflow:hidden; text-overflow:ellipsis; transition:all .2s; }
 .sidebar ul li a:hover { background:#f0eeff; color:#6c5ce7; }
 .sidebar ul li a.active { background:#6c5ce7; color:#fff; }
-.main-content { flex:1; min-width:0; }
+.main-content { flex:1; min-width:0; max-width:1600px; margin:0 auto; }
 .stats-cards { display:flex; gap:14px; margin-bottom:18px; flex-wrap:wrap; }
 .stat-card { flex:1; min-width:120px; background:#fff; border-radius:12px; padding:18px;
              text-align:center; box-shadow:0 2px 12px rgba(0,0,0,.06); }
@@ -265,10 +292,10 @@ body { font-family:"Microsoft YaHei","PingFang SC","Helvetica Neue",Arial,sans-s
 .report-body > p.intro { font-size:13.5px; color:#666; margin-bottom:8px; }
 .report-body h2 { font-size:19px; color:#1a1a2e; margin:26px 0 12px; padding-bottom:6px;
                   border-bottom:2px solid #6c5ce7; scroll-margin-top:18px; }
-.review-table { width:100%; border-collapse:collapse; margin:0 0 8px; font-size:13.5px; }
+.review-table { width:100%; border-collapse:collapse; table-layout:fixed; margin:0 0 8px; font-size:13.5px; }
 .review-table th { background:#f8f7ff; color:#6c5ce7; padding:9px 11px; text-align:left;
                    border-bottom:2px solid #e5e0ff; font-weight:600; white-space:nowrap; }
-.review-table td { padding:10px 11px; border-bottom:1px solid #f0f0f0; vertical-align:top; }
+.review-table td { padding:10px 11px; border-bottom:1px solid #f0f0f0; vertical-align:top; overflow-wrap:break-word; }
 .review-table tr:hover td { background:#fafbff; }
 .review-table td.req { color:#555; font-size:13px; }
 .review-table td .rid { font-size:11px; color:#aaa; margin-top:2px; font-family:ui-monospace,Consolas,monospace; }
@@ -286,6 +313,7 @@ body { font-family:"Microsoft YaHei","PingFang SC","Helvetica Neue",Arial,sans-s
 /* 具体问题清单（原文→建议） */
 .issues { margin:7px 0 0; padding-left:22px; font-weight:400; color:#444; font-size:13px; }
 .issues li { margin:5px 0; line-height:1.6; }
+.issues li.imore { list-style:none; color:#9aa0a6; font-size:12px; }
 .issues .iloc { font-family:ui-monospace,Consolas,monospace; background:#eef1f5; padding:1px 6px;
                 border-radius:4px; font-size:11.5px; color:#666; }
 .issues .iorg { color:#c62828; font-weight:700; }   /* 原文(问题) 红色粗体 */
@@ -362,7 +390,7 @@ def _stat_card(cls, number, label):
             f"<div class='label'>{label}</div></div>")
 
 
-def render_html(reqs, by_id, meta, cats, doc_name, xform=None):
+def render_html(reqs, by_id, meta, cats, doc_name, xform=None, max_issues=30):
     esc = html.escape
     xf = xform or (lambda t: t)
     total = {k: 0 for k in VERDICTS}
@@ -430,10 +458,10 @@ def render_html(reqs, by_id, meta, cats, doc_name, xform=None):
         title = CAT_TITLES.get(cat, cat)
         P.append(f"<h2 id='cat-{ci}'>{esc(title)}</h2>")
         P.append("<table class='review-table'><thead><tr>"
-                 "<th style='width:15%'>检查项</th>"
-                 "<th style='width:27%'>要求</th>"
-                 "<th style='width:9%'>检查结果</th>"
-                 "<th>说明 / 建议</th></tr></thead><tbody>")
+                 "<th style='width:12%'>检查项</th>"
+                 "<th style='width:20%'>要求</th>"
+                 "<th style='width:10%'>检查结果</th>"
+                 "<th style='width:58%'>说明 / 建议</th></tr></thead><tbody>")
         for req in items:
             verdict, res = verdict_of(by_id, req["id"])
             rowclass = VROW.get(verdict, "row-na")
@@ -445,7 +473,7 @@ def render_html(reqs, by_id, meta, cats, doc_name, xform=None):
             cell = [f"<div class='analysis'>{fmt_html(xf(conclusion))}</div>"]
             if issues:
                 cell.append("<ol class='issues'>")
-                for it in issues[:30]:
+                for it in issues[:max_issues]:
                     loc = esc(xf(it.get("loc", "")))
                     org = fmt_html(xf(it.get("original", "")))
                     typ = esc(xf(it.get("type", "")))
@@ -456,6 +484,8 @@ def render_html(reqs, by_id, meta, cats, doc_name, xform=None):
                         item += f"<span class='itype'>[{typ}]</span>"
                     item += f"<br><span class='isug'>建议：{sug}</span></li>"
                     cell.append(item)
+                if len(issues) > max_issues:
+                    cell.append(f"<li class='imore'>……共 {len(issues)} 条，其余 {len(issues) - max_issues} 条未显示（可用 --max-issues 调大）</li>")
                 cell.append("</ol>")
             desc = "".join(cell)
             P.append(
@@ -480,9 +510,15 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     # 默认输出 HTML；用户指定 --format md 时输出 Markdown；--format both 两者都出
     fmt = "html"
+    max_issues = 30
     for a in sys.argv[1:]:
         if a.startswith("--format="):
             fmt = a.split("=", 1)[1]
+        elif a.startswith("--max-issues="):
+            try:
+                max_issues = int(a.split("=", 1)[1])
+            except ValueError:
+                pass
     run_dir = args[0] if args else None
     if not run_dir:
         print("用法: python assemble_report.py <run_dir> [--format md|html|both]（默认 html）")
@@ -493,12 +529,12 @@ def main():
 
     written = []
     if fmt in ("md", "both"):
-        md = render_markdown(reqs, by_id, meta, cats, doc_name, xform)
+        md = render_markdown(reqs, by_id, meta, cats, doc_name, xform, max_issues)
         p = os.path.join(doc_dir, f"{doc_name}_校审报告.md")
         open(p, "w", encoding="utf-8").write(md)
         written.append(p)
     if fmt in ("html", "both"):
-        h = render_html(reqs, by_id, meta, cats, doc_name, xform)
+        h = render_html(reqs, by_id, meta, cats, doc_name, xform, max_issues)
         p = os.path.join(doc_dir, f"{doc_name}_校审报告.html")
         open(p, "w", encoding="utf-8").write(h)
         written.append(p)

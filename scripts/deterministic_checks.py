@@ -51,10 +51,47 @@ def parse_cell(s):
     return ("none", None)
 
 
-def sig_figs(x: float):
-    s = ("%g" % x).replace("-", "").replace("e", ".").replace("E", ".")
-    digits = re.sub(r"[^0-9]", "", s)
-    return len(digits.lstrip("0"))
+def sig_figs(x: float, raw: str = None):
+    """计算有效数字位数。
+
+    水文流量按 SL/T 247《水文资料整编规范》取 3 位有效数字。关键规则：
+      - 整数末尾的零（如 2050 末位的 0）在水文整编语境下是修约占位符，
+        不算有效数字——2050 是"修约到 3 位有效数字"的结果（2,0,5 有效，
+        末位 0 占位），故算 3 位。
+      - 小数末尾的零（如 12.0 末位的 0）是有效的，算入有效数字——
+        12.0 是 3 位（1,2,0），体现修约到 3 位有效数字。
+      - 科学计数法（如 2.05e3）系数部分全算有效数字。
+      - 前导零（0.50 的 0.）不算有效数字——0.50 是 2 位（5,0）。
+    raw: 原始字符串，用于区分整数末尾零 vs 小数末尾零。
+    """
+    if x == 0:
+        return 1
+    src = raw.strip() if raw else ("%g" % x)
+    # 去符号
+    src = src.lstrip("+-")
+    # 科学计数法：取系数部分
+    if "e" in src.lower():
+        src = src.lower().split("e")[0]
+    # 拆整数/小数部分
+    if "." in src:
+        int_part, dec_part = src.split(".", 1)
+    else:
+        int_part, dec_part = src, ""
+    # 整数部分：去前导零
+    int_part = int_part.lstrip("0")
+    if not int_part and not dec_part:
+        return 1
+    if "." in src:
+        # 含小数点：整数部分（去前导零后）+ 小数部分全部数字（含末尾零）都有效
+        n = len(int_part) + len(dec_part)
+        # 但整数部分为 0 时（如 0.50），整数部分那个 0 不算
+        if not int_part:
+            n = len(dec_part)
+        return max(n, 1)
+    else:
+        # 纯整数：去前导零后的位数 - 末尾连续零（水文修约占位，不算有效）
+        stripped = int_part.rstrip("0")
+        return max(len(stripped), 1)
 
 
 _CLEAN_NUM_RE = re.compile(r"^[+-]?[0-9]+(?:\.[0-9]+)?%?$")
@@ -396,7 +433,7 @@ def check_numbers(numbers, fulltext):
         except ValueError:
             continue
         decimals = len(numstr.split(".")[1]) if "." in numstr else 0
-        sf = sig_figs(val)
+        sf = sig_figs(val, numstr)
         if sf > 3 or decimals > 3:
             flow_violations.append({"value": numstr, "sig_figs": sf, "decimals": decimals,
                                     "suggested": _to_3sig(val), "context": n["context"],
@@ -481,6 +518,113 @@ def check_numbering(captions):
     return result
 
 
+# ---------------- 疑点候选生成（groupC 语义核实的先验，只产候选不产结论） ----------------
+DICT_NAME = os.path.join(os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..")), "references", "错字词典.json")
+
+# 合法叠词白名单（正常词语，非错字）
+_LEGIT_DOUBLE_WORDS = [
+    "往往", "渐渐", "缓缓", "徐徐", "屡屡", "频频", "纷纷", "茫茫", "滔滔", "潺潺",
+    "恰恰", "仅仅", "刚刚", "层层", "点点", "丝丝", "阵阵", "熊熊", "绵绵", "皑皑",
+    "久久", "深深", "远远", "高高", "长长", "大大", "小小", "多多", "好好", "快快",
+    "慢慢", "轻轻", "紧紧", "满满", "圆圆", "匆匆", "一一", "等等", "方方面面",
+]
+_LEGIT_DOUBLE_RE = re.compile("|".join(_LEGIT_DOUBLE_WORDS))
+_DOUBLE_RE = re.compile(r"([\u4e00-\u9fa5])\1")
+# 中文语境内的半角标点（前后邻汉字才命中，数字间小数点/千分位不误伤）
+_HALF_PUNCT_RE = re.compile(r"(?<=[\u4e00-\u9fa5])[,;:?!](?=[\u4e00-\u9fa5])")
+_DUP_PUNCT_RE = re.compile(r"，。|。，|，，|。。|、、|；；|：：")
+_MIXED_BRACKET_RE = re.compile(r"（[^（）()]*\)|\([^()（）]*）")
+_BRACKET_PAIRS = [("（", "）"), ("【", "】"), ("《", "》"), ("“", "”")]
+_MAX_SENT_LEN = 150
+_RULE_CAPS = {"叠字": 80, "标点混用": 150, "配对失衡": 60, "长句": 40}
+_MAX_HITS_PER_WORD = 5   # 同一词条最多报 5 处（防"砼"这类高频词爆量）
+
+
+def _load_typo_dict():
+    """加载错字词典（references/错字词典.json），只取 必错/偏好/需上下文 三级。"""
+    if not os.path.exists(DICT_NAME):
+        return []
+    try:
+        data = json.load(open(DICT_NAME, encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    return [e for e in data.get("entries", [])
+            if e.get("tier") in ("必错", "偏好", "需上下文") and e.get("wrong")]
+
+
+def build_suspects(fulltext):
+    """生成 groupC 疑点候选：rule + 段落定位 + 上下文 + 提示。
+    输出仅是候选，判定一律留给语义层核实，维持『宁可漏报不误报』。"""
+    entries = _load_typo_dict()
+    dict_by_wrong = {e["wrong"]: e for e in entries}
+    word_hits = defaultdict(int)
+    caps = defaultdict(int)
+    cands = []
+
+    def add(rule, loc, span, hint):
+        if caps[rule] >= _RULE_CAPS.get(rule, 10 ** 9):
+            return
+        caps[rule] += 1
+        cands.append({"rule": rule, "loc": loc, "span": span[:60], "hint": hint})
+
+    for line in fulltext.splitlines():
+        m = re.match(r"(P\d+)", line)
+        if not m:
+            continue
+        pid = m.group(1)
+        text = line[m.end():]
+        if len(text) < 2:
+            continue
+
+        # 1) 词典（错字/规范偏好/需上下文）
+        for w, e in dict_by_wrong.items():
+            i = text.find(w)
+            while i >= 0 and word_hits[w] < _MAX_HITS_PER_WORD:
+                word_hits[w] += 1
+                add("词典", pid, text[max(0, i - 15):i + len(w) + 15],
+                    "疑为『%s』（%s）" % (e.get("right", ""), e.get("tier", "")))
+                i = text.find(w, i + 1)
+
+        # 2) 叠字（先把合法叠词等长占位再扫描）
+        masked = _LEGIT_DOUBLE_RE.sub(lambda mm: "〇" * len(mm.group(0)), text)
+        for dm in _DOUBLE_RE.finditer(masked):
+            ch = dm.group(1)
+            if ch == "〇":
+                continue
+            s = dm.start()
+            add("叠字", pid, text[max(0, s - 15):s + 17], "疑为叠字（%s%s）" % (ch, ch))
+
+        # 3) 标点混用
+        for pm in _HALF_PUNCT_RE.finditer(text):
+            s = pm.start()
+            add("标点混用", pid, text[max(0, s - 15):s + 16],
+                "中文语境半角标点『%s』" % pm.group(0))
+        for pm in _DUP_PUNCT_RE.finditer(text):
+            s = pm.start()
+            add("标点混用", pid, text[max(0, s - 15):s + 17], "重复标点『%s』" % pm.group(0))
+        for pm in _MIXED_BRACKET_RE.finditer(text):
+            s = pm.start()
+            add("标点混用", pid, text[max(0, s - 15):s + 17], "全半角括号混用")
+
+        # 4) 括号/引号行级配对
+        for l, r in _BRACKET_PAIRS:
+            if text.count(l) != text.count(r):
+                add("配对失衡", pid, text[:50],
+                    "『%s%s』数量不等（%d/%d）" % (l, r, text.count(l), text.count(r)))
+                break
+
+        # 5) 超长句
+        for sent in re.split(r"[。；！？]", text):
+            if len(sent) > _MAX_SENT_LEN:
+                add("长句", pid, sent[:60] + "…（%d 字无句读）" % len(sent), "超长句，通顺性待核")
+
+    summary = {"total": len(cands)}
+    for c in cands:
+        summary[c["rule"]] = summary.get(c["rule"], 0) + 1
+    return {"summary": summary, "candidates": cands}
+
+
 def main():
     args = sys.argv[1:]
     run_dir = args[0] if len(args) > 0 else None
@@ -507,9 +651,11 @@ def main():
     det_cit = check_citations(citations, INDEX)
     det_num = check_numbers(numbers, fulltext)
     det_num7 = check_numbering(captions)
+    det_sus = build_suspects(fulltext)
 
     for name, data in (("det_table.json", det_table), ("det_citations.json", det_cit),
-                       ("det_numbers.json", det_num), ("det_numbering.json", det_num7)):
+                       ("det_numbers.json", det_num), ("det_numbering.json", det_num7),
+                       ("det_suspects.json", det_sus)):
         json.dump(data, open(os.path.join(run_dir, name), "w", encoding="utf-8"),
                   ensure_ascii=False, indent=1)
 
@@ -525,6 +671,7 @@ def main():
     for t, r in det_num7.items():
         print(f"  图表编号({t}) 共 {r['count']} 个题录，格式 {r['formats']}，"
               f"格式不一致={r['format_inconsistent']}，序号问题 {len(r['issues'])} 组")
+    print(f"  疑点候选(C组先验) 共 {det_sus['summary']['total']} 条：{det_sus['summary']}")
 
 
 if __name__ == "__main__":

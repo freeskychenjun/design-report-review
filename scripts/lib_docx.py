@@ -175,6 +175,7 @@ def ensure_docx(path: str) -> str:
                 pass
 
     # 方案2：Windows Word COM (pywin32)
+    word = None
     try:
         import win32com.client  # type: ignore
         word = win32com.client.Dispatch("Word.Application")
@@ -182,11 +183,22 @@ def ensure_docx(path: str) -> str:
         d = word.Documents.Open(p, ReadOnly=True)
         d.SaveAs(target, FileFormat=16)  # 16 = wdFormatXMLDocument (.docx)
         d.Close(False)
-        word.Quit()
+        # SaveAs 成功后立即检查文件——不因后续 Quit 的 RPC 偶发错误而判失败
         if os.path.exists(target):
             return target
     except Exception:
         pass
+    finally:
+        # word.Quit() 单独兜底：Word 进程退出时偶发 RPC 错误，不影响已生成的文件
+        if word is not None:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+
+    # 最后再确认一次（Quit 异常情况下文件可能已生成）
+    if os.path.exists(target):
+        return target
 
     raise RuntimeError(
         "无法转换 .doc 文件为 .docx。请先用 Word 另存为 .docx，"

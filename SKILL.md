@@ -7,7 +7,7 @@ description: 对水利工程设计报告（Word .docx/.doc）进行智能校审�
 
 本技能对一份水利工程设计报告（项目建议书/可研/初设等，Word 文档）执行**逐条、可追溯**的智能校审，覆盖 `references/检查要求.md` 的 **8 大类 42 条**检查要求，并按其"检查结果输出要求"产出校审报告：**默认输出 HTML**（用户明确要求 Markdown 时输出 Markdown）。每条要求都一一对应、不遗漏（即使全部符合也输出主要分析结论），并引用完整的各检查项要求原文。两种格式均**正确渲染上标/下标**（m3/s→m³/s、10的8次方→10⁸、km²、H2O→H₂O 等）。HTML 版为**仪表板式**：顶部横幅 + 左侧目录（滚动高亮）+ KPI 统计卡 + 问题筛选（全部/仅存在问题/仅不符合）+ 按类别表格化结论（每条一行、行级配色），便于速览与归档。
 
-> 设计要点：**确定性脚本**负责抽取与机器可验证的硬证据（数值、引用对照、表格核算、编号顺序），**并行 subagent** 负责语义判断（条文落实、一致性、语法、合理性）。二者结合保证严谨与高效。
+> 设计要点（提速版）：**确定性脚本**负责抽取与机器可验证的硬证据（数值、引用对照、表格核算、编号顺序），其中**纯规则条目直接出结论**（不再派 subagent）；**并行 subagent** 只跑语义判断（5 组 fan-out）。每个 subagent 只读**按组裁剪后的切片文件**（`_slices/` 下的组切片），而非全文。二者结合保证严谨、高质量与高效率。
 
 ---
 
@@ -15,7 +15,7 @@ description: 对水利工程设计报告（Word .docx/.doc）进行智能校审�
 
 - 技能根目录（下称 `$SKILL`）= 本 SKILL.md 所在目录。
 - 依赖：Python 3 + `python-docx`、`lxml`（已随环境安装）。Windows 下 `.doc` 转换可选依赖 LibreOffice 或 pywin32。
-- 关键脚本：`$SKILL/scripts/` 下的 `build_reference_index.py`、`extract_docx.py`、`deterministic_checks.py`、`parse_requirements.py`。
+- 关键脚本：`$SKILL/scripts/` 下的 `extract_docx.py`、`deterministic_checks.py`、`slice_artifacts.py`、`det_findings.py`、`collect_findings.py`、`assemble_report.py`、`page_map.py`、`maintain.py`。
 - 参考/索引（首次运行自动生成）：`$SKILL/scripts/references_index.json`、`$SKILL/scripts/requirements.json`。
 - 运行产物目录：`$SKILL/_run/<文档名去后缀>/`。
 
@@ -26,20 +26,31 @@ cd "$SKILL" && python scripts/maintain.py --force   # 一键（等价于分别�
 
 ---
 
-## 1. 流程总览（5 步）
+## 1. 流程总览（6 步）
 
 ```
 [输入 docx]
-   │  ① 抽取  extract_docx.py
+   │  ① 抽取            extract_docx.py
    ▼
-artifacts: fulltext.md / tables.json / captions.json / citations.json / numbers.json / meta.json
-   │  ② 确定性检查  deterministic_checks.py
+artifacts: fulltext.md / tables.json / captions.json / citations.json / numbers.json / meta.json / locators.json
+   │  ①b 页码定位（可选，后台） page_map.py ←与③并行执行，⑤前汇合
+   │  ② 确定性检查       deterministic_checks.py
    ▼
 证据: det_table.json / det_citations.json / det_numbers.json / det_numbering.json
-   │  ③ 并行语义检查（按8大类 fan-out subagent，每类1个；轻量类可合并）
+   │  ②b 按组切片        slice_artifacts.py        【新】
+   │  ②c 直出4条结论     det_findings.py           【新】
    ▼
-各条结构化结论 (id → 结论/依据/定位)
-   │  ④ 合成报告（逐条对应 + 引用原文 + 即使符合也写结论；默认 .html，用户指定时 .md）
+_slices/groupA1/A2/B/C/D.json（裁剪后小文件） + det_findings.json（std_001/003/004、gram_007）
+   │  ③ 并行语义检查（5 组 subagent，每组只读对应 _slices/ 组切片；同时后台跑 ①b）
+   ▼
+各 subagent 写 groupX.json 到 <run_dir>/（按 schema）
+   │  ④ 收集+合并+校验   collect_findings.py       【新】
+   ▼
+findings.json（42 条全覆盖；det 覆盖 subagent；缺失败占位"未检出"）
+   │  ④b 结论润色         polish_findings.py        【新】去除机器字段名
+   ▼
+findings.json（机器黑话已翻译为自然语言）
+   │  ⑤ 合成报告         assemble_report.py
    ▼
 [输出 <文档名>_校审报告.html（默认）/ <文档名>_校审报告.md（用户指定时）]
 ```
@@ -51,42 +62,81 @@ python "$SKILL/scripts/extract_docx.py" "<docx或doc路径>" ["<输出目录>"]
 默认输出到 `$SKILL/_run/<文档名>/`。`.doc` 会自动尝试转换；转换失败则提示用户另存为 `.docx`。
 抽取同时生成 `locators.json`：每段最近**章节标题**、每表**题录号(表X.X.X)** 映射。
 
-### ①b 页码定位（可选，需 Windows + Word）
+### ①b 页码定位（可选，需 Windows + Word；后台与 ③ 并行）
 ```bash
 python "$SKILL/scripts/page_map.py" "$SKILL/_run/<文档名>"
 ```
 用 Word COM 计算每个顶层段落对应的 **Word 页码**，回填 `locators.json` 的 `page_by_para`（无 Word 时跳过，定位自动回退为章节标题§）。合成时 `P0154`→`第16页`、`T039`→`表3.7.2.2`。
+**提速要点**：Word 分页较慢（约 1~2 分钟），而 `page_by_para` 只被 ⑤ 合成使用（②切片、③subagent 均不读它）——因此在 ②c 完成后**立即后台启动**（`run_in_background`），与 ③ 的 subagent 并行执行，⑤ 之前确认其完成即可，**墙钟零增加**。
 
 ### ② 确定性检查
 ```bash
 python "$SKILL/scripts/deterministic_checks.py" "$SKILL/_run/<文档名>"
 ```
-产出四份 `det_*.json` 证据并打印摘要。**这些证据是数值类、对照类检查的权威依据，subagent 必须优先引用。**
+产出五份 `det_*.json` 证据并打印摘要（含 `det_suspects.json` 错字/叠字/标点疑点候选，由 `references/错字词典.json` 驱动，供诊断与词典召回评估，**不进切片**——实测候选核实会拖慢 C 组，2026-09-27 实验已回退）。**这些证据是数值类、对照类检查的权威依据，subagent 必须优先引用。**
 
-### ③ 并行语义检查（效率核心）
-将 42 条要求按**类别**分为若干组，**同一条消息内并发启动多个 subagent**（Agent 工具一次发多个调用；或使用 Workflow 工具）。每个 subagent 只读取本类所需 artifacts/证据，互不阻塞。建议分组（轻量类 `ds_*`、`lr_*` 可合并为一组）：
+### ②b 按组切片（提速核心）
+```bash
+python "$SKILL/scripts/slice_artifacts.py" "$SKILL/_run/<文档名>"
+```
+按 5 个分组裁剪产物，生成 `_slices/groupA1/A2/B/C/D.json`（大报告会自动限量：表格只给有问题的+采样、numbers 只给 moduli/flows、references_index 只给命中项、全文按疑点关键词裁剪）。**A1（强条 mp，11 条）与 A2（常见 ci，9 条）共用同一份 A 数据切片**——内容与拆分前 groupA 完全一致，仅提示词中要求清单不同；拆组只为把原 20 条最重组的负载减半，不丢任何证据。**subagent 只读切片，不再灌全文。**
 
-| 组 | 检查项 | 主用 artifacts | 主用证据 |
-|----|--------|----------------|----------|
-| A 强制性条文 | mp_001–011 | fulltext.md | （语义判断） |
-| B 常见设计问题 | ci_flood/runoff/stage/water/drainage | fulltext.md、numbers.json、tables.json | det_numbers(排涝模数) |
-| C 一致性 | cons_001–003 | fulltext.md、tables.json、numbers.json | — |
-| D 语法表述 | gram_001–008 | fulltext.md、captions.json | det_numbering.json |
-| E 文字规范 | std_001–004 | det_numbers.json、fulltext.md | det_numbers.json |
-| F 设计标准+法律法规 | ds_001–002、lr_001–002 | det_citations.json | det_citations.json + references_index.json |
-| G 表格逻辑 | tbl_001–003 | tables.json | det_table.json |
+### ②c 直出 4 条结论（提质 + 提速核心）
+```bash
+python "$SKILL/scripts/det_findings.py" "$SKILL/_run/<文档名>"
+```
+把 4 条纯规则条目直接转成 findings 结构（`det_findings.json`），**这 4 条不再派 subagent**：
 
-> 每组 subagent 用 Read 工具按需读取上表文件（避免一次性加载全部大文件）。`fulltext.md` 用 Grep/分段 Read 定位关键词。
+| id | 判定规则（来自 det_*.json） |
+|---|---|
+| std_001 | `std001_bigunit.mixed_form`：文字单位与10的次方混用→不符合 |
+| std_003 | `std003_flow.violations`：>3位有效数字或小数>3位→不符合 |
+| std_004 | `std004_grade`：存在 issue（罗马/阿拉伯误用）→不符合 |
+| gram_007 | `det_numbering`：重复/断号→不符合；仅格式不统一→部分符合 |
 
-### ④ 合成报告
-收集所有 subagent 的结构化结论，与 `requirements.json` 比对，**确保 42 条全覆盖**（缺失项补查），再运行 `assemble_report.py` 合成报告（默认 HTML；用户明确要求 Markdown 时加 `--format md`，见第 4 节格式）。
+> 理由：这些是数数/查表/加法，脚本比 LLM 更准（实测 std_003 脚本抓 23 处 vs LLM 15 处）。SKILL 设计原则"宁可漏报也不误报"，det 给的 fail 是高置信硬伤。
+
+### ③ 并行语义检查（5 组 fan-out，效率核心）
+**在一条消息内并发启动 5 个 subagent**（Agent 工具一次发 5 个调用）。每个 subagent 只读**一个切片文件** `_slices/groupX.json`（X∈A1,A2,B,C,D），互不阻塞。
+
+| 组 | 检查项 | 条数 | 读切片 | 附 det 证据（已在切片内） |
+|---|---|---|---|---|
+| **A1** 强条 | mp_001–011 | 11 | groupA1.json | det_std003_brief |
+| **A2** 常见 | ci_flood/runoff/stage/water/drainage | 9 | groupA2.json | det_std003_brief |
+| **B** 一致性+表格 | cons_001–003、tbl_001–003 | 6 | groupB.json | det_table_brief(fail/warn/info) |
+| **C** 语法+文字 | gram_001–006/008、std_002 | 8 | groupC.json | det_numbering、det_std004_grade |
+| **D** 标准+法规 | ds_001–002、lr_001–002 | 4 | groupD.json | det_citations_brief(summary+可疑清单) |
+
+> A1/A2 的数据切片与拆分前 groupA 完全一致（fulltext 关键词切片 + flows/moduli + std003 摘要），拆组不减证据、只减每组条数。
+
+> **不派 subagent 的 4 条**：std_001、std_003、std_004、gram_007（由 ②c 直出）。
+> **半直出条目**（tbl_001/ds_001/ds_002/lr_001/lr_002）：det 硬证据已在切片内，subagent 直接引用 det 结论，不重复核算。
+> **大报告**：groupC 切片会提示"用 Grep 分段读 fulltext.md"检查标点/错字，勿一次性读全文。
+
+### ④ 收集+合并+校验
+```bash
+python "$SKILL/scripts/collect_findings.py" "$SKILL/_run/<文档名>"
+```
+收集 4 个 subagent 的 groupX.json + det_findings.json，校验字段、**det 覆盖同 id 的 subagent 结果**、对照 requirements.json 确保 42 条全覆盖（缺失按"未检出"占位），输出 `findings.json`。
+
+### ④b 结论润色（必跑）
+```bash
+python "$SKILL/scripts/polish_findings.py" "$SKILL/_run/<文档名>"
+```
+subagent 有时会把切片里的 det 证据字段名（`det_citations_brief.summary`、`consistency_issues=0`、`grid_omitted`、`n_fail` 等）直接照抄进给用户看的结论。本脚本把这些机器黑话翻译成自然语言（"机器核算 0 项不合格""未发现前后写法不一致"等），并清理替换后产生的不通顺。**必须在 collect 之后、assemble 之前运行**，原地更新 `findings.json`。
+
+### ⑤ 合成报告
+```bash
+python "$SKILL/scripts/assemble_report.py" "$SKILL/_run/<文档名>" [--format md|html|both]
+```
+默认 HTML；用户明确要求 Markdown 时加 `--format md`。`assemble_report.py` 内置 det 双保险（det_findings 覆盖优先），并给 det 来源条目标注"（机器判定）"。每条检查项的问题清单默认最多列 30 条，可用 `--max-issues=N` 调节；超限时列表末尾会明示"共 X 条，其余 Y 条未显示"。
 
 ---
 
 ## 2. 产物与证据字段速查
 
-- **fulltext.md**：全文，每段前缀 `P0123`（段落序号）/`[H3]`（标题层级）；表格以 `【表012】(r×c) 题录（详见 tables.json#12）` 标记。→ 用于语义判断与定位引用。
-- **tables.json**：`[{id,pid,caption,nrows,ncols,header,grid,section}]`，`grid` 为二维文本（合并单元格已重建）。→ 表格检查直接读 grid。
+- **fulltext.md**：全文，每段前缀 `P0123`（段落序号）/`[H3]`（标题层级）；表格以 `【表012】(r×c) 题录（详见 tables.json#12）` 标记。→ 语义判断与定位引用（subagent 一般不直接读，走切片）。
+- **tables.json**：`[{id,pid,caption,nrows,ncols,header,grid,section}]`，`grid` 为二维文本（合并单元格已重建）。→ 表格检查（切片已含问题表 grid）。
 - **captions.json**：`[{type:图|表,num,text,is_def,para_idx,section}]`。→ 题录/编号检查。
 - **citations.json**：`[{kind,std|law|law_code|std_name_only,raw,norm_code,name,norm_name,para_idx,context}]`。→ 引用检查的原始数据。
 - **numbers.json**：`[{key:flows|moduli|areas_km2|areas_mu|bigunits|pow10,value,raw,para_idx,context}]`。
@@ -94,29 +144,28 @@ python "$SKILL/scripts/deterministic_checks.py" "$SKILL/_run/<文档名>"
 - **det_citations.json**：`{citations:[{kind,raw,norm_code,name,validity,note,...}],consistency:[...],summary}`。`validity`：`valid/not_in_list/year_mismatch/valid_name`。
 - **det_numbers.json**：`std003_flow`(流量有效数字违规)、`std001_bigunit`(大数单位形式)、`std004_grade`(等别/级别罗马-阿拉伯)。
 - **det_numbering.json**：`{图/表:{count,formats,format_inconsistent,issues}}`。
-- **references_index.json**：标准/法规按 `norm_code`、`norm_name`、`prefix_num` 检索。
+- **det_suspects.json**：`{summary, candidates:[{rule,loc,span,hint}]}`，错字词典+叠字/标点/配对/长句五类规则产的疑点候选（**只产候选不产结论**）。安徽两湖实测对 C 组金标准召回 28%，未接入切片（实验记录见 tests/README.md）。
+- **references/错字词典.json**：错字词典 76 条四级分档（挖掘自 414 份平台历史校审报告 + 20 个运行目录 + 行业补录），驱动 det_suspects 词典规则；增量维护用工作区 `词典/harvest_typos.py` 重跑。
+- **_slices/groupA..D.json**：按组裁剪的切片（见 ②b）。**subagent 的唯一输入**。
+- **det_findings.json**：4 条直出结论（std_001/003/004、gram_007），格式同 findings.json 子集。
+- **references_index.json**：标准/法规按 `norm_code`、`norm_name`、`prefix_num` 检索（切片已含命中项，subagent 不直接读全索引）。
 - **requirements.json**：`[{category,subcategory,id,name,content}]`（42 条）。
 
 ---
 
 ## 3. Subagent 提示模板与输出 schema
 
-给每个 subagent 的提示（按组填充 `<...>`）：
+给每个 subagent 的提示（按组填充 `<...>`，**只读一个切片文件**）：
 
 ```
 你是水利工程设计报告校审专家。请对以下检查要求【逐条】给出结论。
-只使用我提供的 artifacts/证据 与文档原文，禁止臆测；每条结论必须给出文档中的定位(段落号 PXXXX / 表号 / 题录)与原文片段作为依据。
+只使用我提供的切片数据 与（必要时 Grep 读取的）文档原文，禁止臆测；每条结论必须给出文档中的定位(段落号 PXXXX / 表号 / 题录)与原文片段作为依据。
 
 【本组检查要求】（必须全部覆盖，逐条响应）：
 <粘贴 requirements.json 中本组各条 的 id/name/content 原文>
 
-【可用数据】（按需用 Read/Grep 读取，路径相对运行目录）：
-- 全文：$SKILL/_run/<文档名>/fulltext.md
-- 表格：$SKILL/_run/<文档名>/tables.json
-- …（按组列出上表中的 artifacts/证据文件）
-
-【确定性证据摘要】（优先引用，避免与机器核算冲突）：
-<粘贴对应 det_*.json 中与本组相关的条目/摘要>
+【唯一输入】读取这一个文件（含本组所需的裁剪后全文/表格/数值/det 证据）：
+$SKILL/_run/<文档名>/_slices/group<X>.json
 
 【判定口径】
 - 符合：报告完整满足该要求。
@@ -124,17 +173,30 @@ python "$SKILL/scripts/deterministic_checks.py" "$SKILL/_run/<文档名>"
 - 不符合：存在明确问题或缺失。
 - 不适用：该要求不适用于本文档（须说明原因）。
 - 即便全部符合，也要写出主要分析结论与支撑定位。
-- 涉及数值/标准/法规时，以 det_*.json 与 references_index.json 为准。
+- 涉及数值/标准/法规时，切片内已附 det 证据摘要，直接引用，不重复核算。
+- **不适用判定纪律**：判"不适用"前必须先在切片的全文/关键词切片中检索该项关键词（如 水面线、壅水、糙率、洪痕、考证、率定、插补、比拟法、分期、高程系统）；凡文档中存在与该要求对应的分析或计算内容——即使只是汇编性描述、背景引用、施工期或局部河段内容——一律视为适用并按符合程度判定；只有全文完全无相关内容才可判"不适用"，且结论中须列出已检索而未命中的关键词。
+- **判定尺度**：要求中的每个动作词（说明/分析/论证/率定/对比/校核/考证）在正文中缺失或只完成一部分，该项即至少判"部分符合"并逐处列出缺口；不得因正文提及相关主题、资料名或规范名而判"符合"。
+（实测教训 2026-09-27：无此两道防线时，拆组后单组曾把文档中已有的水面线推算、分期施工期洪水误判"不适用"，漏报约 9 处问题；加入防线后 issues 由 18→40，反超旧架构基线的 26。）
 
 【具体问题清单——关键要求，避免空泛】
 对"部分符合/不符合"的检查项，**必须**逐处列出具体问题（不要只写"需逐处订正"这类空话），每条给：
 - loc：段落号 PXXXX（合成时会自动转成 Word 页码"第N页"）
 - original：从原文**精确照抄**的问题片段（含错字/原样）
 - type：问题类型（2-6字，如"叠字/错字/标点/量纲/前后矛盾/编号倒置"）
-- suggestion：**逐字修改建议**——直接给出修改后的文字 + 简述改法（如 original="进行了了技术改造" suggestion="进行了技术改造（删去重复的'了'）"）
-尽量穷尽明显问题（每项可多条，宁缺毋滥、不编造）。语法表述(gram_*)、文字规范(std_*)、表格(tbl_*)、一致性(cons_*)等尤其需要这种可操作清单。
+- suggestion：**逐字修改建议**——直接给出修改后的文字 + 简述改法
+尽量穷尽明显问题（每项可多条，宁缺毋滥、不编造）。
 
-【输出】严格输出 JSON（仅 JSON）：
+【⚠ 结论措辞要求】conclusion 是给报告作者看的，**禁止**出现切片文件的内部字段名或自称。
+不要写 "det_citations_brief.summary 显示 consistency_issues=0""grid_omitted:true"
+"n_fail=0""空数组" 这类机器黑话，也不要写 "本组切片""本组""所提供切片" 这类暴露
+内部实现的措辞——一律用"本文档/报告"自称。要把机器证据翻译成自然语言，如"机器核对
+未发现前后不一致""表格未提供单元格数据""0 项不合格"。可引用具体数值和定位，但不要
+暴露字段路径或切片概念。语法(gram_*)、一致性(cons_*)等尤其需要这种可操作清单。
+
+【大报告提示】若切片含 _fulltext_note（全文过大），gram_001–006（标点/错字/通顺）请用 Grep 在
+<run_dir>/fulltext.md 按段落号区间分段（如 P0000–P0500）逐段读取检查，每段报具体 loc+original+suggestion。
+
+【输出】严格输出 JSON（仅 JSON），保存到 $SKILL/_run/<文档名>/group<X>.json：
 {"category":"<组名>","results":[
   {"id":"<编号>","name":"<名称>","verdict":"符合|部分符合|不符合|不适用",
    "conclusion":"<结论，含主要分析>","evidence":[{"loc":"<定位>","quote":"<原文片段>"}],
@@ -142,14 +204,19 @@ python "$SKILL/scripts/deterministic_checks.py" "$SKILL/_run/<文档名>"
 ]}
 ```
 
+> 5 个 subagent 各写一个 `groupA1/A2/B/C/D.json`（category 取本组对应的检查类别名：A1="强制性条文检查"、A2="常见设计问题检查"；B 组的"一致性检查"+"表格逻辑关系专项检查"可拆成两个 results 数组或分两个文件，collect_findings 都能识别）。收齐后进入 ④。
 
-> subagent 若发现某条要求需补充数据，可自行 Read 对应文件。收齐 8 组 JSON 后进入合成。
+### ⚠ 流程纪律（禁止现场拼脚本）
+
+- 中间产物一律走 `slice_artifacts.py` / `collect_findings.py`。
+- **不得**在 `_run/` 下创建 `build_findings.py`、`_merge.py`、`merge_findings.py`、`extra_*.json` 等临时脚本或临时合并文件——这些是历史绕路产物，已由 collect_findings 取代。
+- subagent 的输出必须是符合 schema 的 `groupX.json`，不得输出其他命名。
 
 ---
 
 ## 4. 报告输出格式（严格遵守"检查结果输出要求"）
 
-- 与要求**一一对应、不遗漏**：按 `requirements.json` 顺序，42 条全部出现；与 subagent 结论比对，缺失立即补查。
+- 与要求**一一对应、不遗漏**：按 `requirements.json` 顺序，42 条全部出现；collect_findings 已确保全覆盖。
 - **引用完整要求原文**：每条在结论前以引用块给出该条要求全文（取自 requirements.json 的 content；强制性条文条目含规范条款原文）。
 - 即便符合，也写"主要分析结论"。
 - **默认输出 HTML**，保存到**输入文档同目录**：`<文档名>_校审报告.html`（**仪表板式**：顶部横幅 + 左侧目录(滚动高亮) + KPI 统计卡(总数/符合/存在问题/符合率) + 问题筛选(全部/仅存在问题/仅不符合) + 按类别表格化结论(列：检查项｜要求｜检查结果｜说明/建议，每条一行、行级配色 绿/橙/红/灰、有问题内容红色粗体)，说明/建议列只给结论与建议（不单列定位依据引用），浏览器直接打开/归档、支持打印）。
@@ -164,7 +231,7 @@ python "$SKILL/scripts/deterministic_checks.py" "$SKILL/_run/<文档名>"
 
 - 文件：<文档名>　段落：<n>　表格：<n>　标题：<n>
 - 校审依据：检查要求.md（8 大类 42 条）；标准清单：水利标准.md；法规清单：法律法规.md
-- 生成方式：确定性脚本 + 并行语义检查
+- 生成方式：确定性脚本（抽取+机器证据+4条直出）+ 5组并行语义检查
 
 ## 一、强制性条文检查
 ### mp_001 设计洪水计算过程检查
@@ -192,14 +259,27 @@ python "$SKILL/scripts/deterministic_checks.py" "$SKILL/_run/<文档名>"
 
 ## 5. 效率与降级
 
-- **首选并行**：在**一条消息内**同时发起多组 subagent（Agent 工具并发，或 Workflow 工具）。8 组可同时跑，墙钟≈最慢一组。
-- **大文件**：fulltext.md 较大时，subagent 用 Grep 定位关键词后再分段 Read，勿整文件灌入。
-- **降级**：若无法并发，按 A→G 顺序逐组串行，结果不变。
-- **证据优先**：凡 det_*.json 已给出的结论（如 std_003 流量有效数字、ds 标准有效性、gram_007 编号格式不一致），subagent 直接引用、不重复人工核算，避免误判。
+- **首选 5 组并行**：在**一条消息内**同时发起 5 个 subagent（A1/A2/B/C/D），墙钟≈最慢一组；原 A 组（20 条最重）已拆为 A1（11 条）+A2（9 条），共用同一数据切片，负载均衡且证据不缩水。
+- **page_map 后台并行**：①b（Word 分页约 1~2 分钟）只被 ⑤ 使用，与 ③ 同时后台执行，不占墙钟。
+- **切片已限量**：subagent 无需自行判断读什么。
+- **大报告**：groupC 切片会提示用 Grep 分段读 fulltext.md 查标点/错字；groupB 表格只给有问题的+采样。
+- **降级**：若无法并发，按 A1→A2→B→C→D 顺序逐组串行，结果不变。
+- **证据优先**：凡 det_*.json 已给出的结论（std_003 流量有效数字、std_001 大数单位、std_004 等别级别、gram_007 编号——由 det_findings 直出；tbl_001 表格 fail、ds 标准有效性——切片内附摘要），subagent 直接引用、不重复人工核算，避免误判。
 
 ---
 
-## 6. 边界与注意
+## 6. 回归测试（发布纪律）
+
+`$SKILL/tests/` 下有金标准测试集与门禁脚本，**任何对 SKILL.md、subagent 提示词、scripts 的改动，发布前必须过门禁**：
+
+- 金标准：`tests/golden/shanxu`（小文档，109 处问题）、`tests/golden/anhui`（超大文档，236 处问题），各含冻结的 `artifacts/`（抽取产物+det 证据+切片）与 `findings_golden.json`。**只读**；更新属刻意行为，须重校准并在 golden_meta.json 记录原因。
+- findings 门禁：`python tests/regression_check.py findings <run_dir> --golden tests/golden/<名>`，五项检查——42 条覆盖且未检出=0；verdict 翻转分类（**"部分符合/不符合→符合/不适用"的放宽方向 = FAIL**，漏报信号）；各条 issue 数量下限（金标准 ≥5 条的项须 ≥80%）；反幻觉抽查（issue 的原文片段与 loc 段落号必须能在产物中找到，det 直出条目除外）；机器黑话=0。
+- artifacts 门禁：`python tests/regression_check.py artifacts <run_dir> --golden ... [--allow groupC,det_suspects]`，确定性产物与切片逐项比对，预期变更用 --allow 豁免。
+- 纪律：小改动跑 shanxu；涉及切片/分组/提示词的改动跑 anhui 全流程。**FAIL 即回滚或修复**，不得为放行而放宽门槛（门槛调整本身须记录并重校准）。
+
+---
+
+## 7. 边界与注意
 
 - `.doc`（旧二进制）：脚本自动尝试 LibreOffice/Word 转换；失败则要求用户另存 `.docx`。
 - 表格合并单元格已重建为二维网格；`det_table` 对多合计行/列、kW/台双单位、区间值等只给 `info`，**是否成问题由 G 组 subagent 结合 grid 判定**。
