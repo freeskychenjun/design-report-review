@@ -514,11 +514,23 @@ def render_html(reqs, by_id, meta, cats, doc_name, xform=None, max_issues=30):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    # 兼容 "--format md" 与 "--format=md" 两种写法（历史上只认等号，空格写法静默回落默认 html）
+    argv = sys.argv[1:]
+    normalized = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--format", "--max-issues") and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+            normalized.append(a + "=" + argv[i + 1])
+            i += 2
+        else:
+            normalized.append(a)
+            i += 1
+    args = [a for a in normalized if not a.startswith("--")]
     # 默认输出 HTML；用户指定 --format md 时输出 Markdown；--format both 两者都出
     fmt = "html"
     max_issues = 30
-    for a in sys.argv[1:]:
+    for a in normalized:
         if a.startswith("--format="):
             fmt = a.split("=", 1)[1]
         elif a.startswith("--max-issues="):
