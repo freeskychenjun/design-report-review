@@ -21,6 +21,13 @@ import os
 import re
 import sys
 
+# GBK 控制台自愈：打印 ✓/✗ 等会 UnicodeEncodeError 且产物不落盘（2026-09-30 实测）
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib_docx import (  # noqa: E402
     iter_block_items, para_text, para_style, grid_from_table, ensure_docx,

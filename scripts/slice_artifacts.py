@@ -16,6 +16,12 @@ slice_artifacts.py — 报告智能校审技能 · 按分组裁剪产物（提�
   拆组只为把原 20 条的最重组负载减半，墙钟≈各组最大值，不丢任何证据）
 （std_001/003/004、gram_007 由 det_findings.py 直出，不派 subagent，故不进 slice）
 
+每个切片内嵌本组 "requirements" 字段（id/name/content 原文，取自
+requirements.json）——下发提示词直接引用切片内清单，杜绝手抄漏条
+（2026-09-30 实战曾手抄漏发 ci_runoff_002/ci_water_002/ci_water_003 共 3 条）。
+生成前做分组覆盖自检：5 组清单 ∪ det 直出 4 条必须恰好等于全部要求，
+不等即分组定义与 requirements.json 漂移，立即报错退出。
+
 用法：
   python slice_artifacts.py <run_dir>
   → <run_dir>/_slices/groupA1.json / groupA2.json / groupB.json / groupC.json / groupD.json
@@ -26,6 +32,46 @@ import json
 import os
 import re
 import sys
+
+# 直出条目（det_findings.py 直出，不进任何切片）
+DET_DIRECT_IDS = {"std_001", "std_003", "std_004", "gram_007"}
+
+# 分组 → 要求 id 过滤规则（分组定义与 SKILL.md 第 3 节一致；
+# 切片内 requirements 清单由本表从 requirements.json 程序化生成，禁止手抄）
+GROUP_ID_RULES = {
+    "A1": lambda rid: rid.startswith("mp_"),
+    "A2": lambda rid: rid.startswith("ci_"),
+    "B":  lambda rid: rid.startswith(("cons_", "tbl_")),
+    "C":  lambda rid: (rid.startswith("gram_") and rid not in DET_DIRECT_IDS) or rid == "std_002",
+    "D":  lambda rid: rid.startswith(("ds_", "lr_")),
+}
+
+
+def _console_safe():
+    # GBK 控制台下打印 ✓/✗ 会 UnicodeEncodeError 且中断写入，errors=replace 自愈
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
+def _group_requirements(here):
+    """按 GROUP_ID_RULES 从 requirements.json 生成各组要求清单，并做覆盖自检。"""
+    reqs = _read_json(os.path.join(here, "requirements.json")) or []
+    by_group = {g: [{"id": r["id"], "name": r.get("name", ""), "content": r.get("content", "")}
+                    for r in reqs if "id" in r and rule(r["id"])]
+                for g, rule in GROUP_ID_RULES.items()}
+    covered = {r["id"] for lst in by_group.values() for r in lst} | DET_DIRECT_IDS
+    all_ids = {r["id"] for r in reqs if "id" in r}
+    if covered != all_ids:
+        miss, extra = sorted(all_ids - covered), sorted(covered - all_ids)
+        print(f"[slice] ✗ 分组覆盖自检失败：requirements 有而分组未覆盖 {miss}；"
+              f"分组有而 requirements 无 {extra}。分组定义与要求清单漂移，禁止继续——"
+              f"这正是 2026-09-30 漏发 3 条 ci_* 的根因，请核对 GROUP_ID_RULES。")
+        sys.exit(1)
+    return by_group
+
 
 # ---- groupA 关键词：强条+常见设计问题涉及的水文主题 ----
 # 用更具体的短语，避免"资料/合理性/系列"等在水利报告里高频的泛词把全文都选中
@@ -374,7 +420,16 @@ def build_groupD(run_dir, here):
     }
 
 
+def _write_slice(out_dir, name, data, n_reqs):
+    p = os.path.join(out_dir, name)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    size_kb = os.path.getsize(p) / 1024
+    print(f"[slice] {name}: {size_kb:.1f} KB（含 {n_reqs} 条要求清单）")
+
+
 def main():
+    _console_safe()
     args = sys.argv[1:]
     run_dir = args[0] if args else None
     if not run_dir or not os.path.isdir(run_dir):
@@ -384,41 +439,32 @@ def main():
     out_dir = os.path.join(run_dir, "_slices")
     os.makedirs(out_dir, exist_ok=True)
 
-    builders = [
-        ("groupB.json", build_groupB),
-        ("groupC.json", build_groupC),
-    ]
-    # groupD 需要 here（读 references_index）
-    groupD = build_groupD(run_dir, here)
+    # 各组要求清单（程序化取自 requirements.json + 覆盖自检，漂移即退出）
+    reqs_by_group = _group_requirements(here)
 
-    for name, fn in builders:
+    for name, fn, gkey in (("groupB.json", build_groupB, "B"),
+                           ("groupC.json", build_groupC, "C")):
         data = fn(run_dir)
-        p = os.path.join(out_dir, name)
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
-        size_kb = os.path.getsize(p) / 1024
-        print(f"[slice] {name}: {size_kb:.1f} KB")
+        data["requirements"] = reqs_by_group[gkey]
+        _write_slice(out_dir, name, data, len(reqs_by_group[gkey]))
 
     # A 组数据一份，A1（强条 mp）/A2（常见 ci）两个组共用：
-    # 内容与拆分前 groupA 完全一致，仅 _doc 标注各自范围，拆组不减证据。
+    # 数据切片与拆分前 groupA 完全一致，仅 _doc 与 requirements 清单不同，拆组不减证据。
     data_a = build_groupA(run_dir)
-    for name, doc in (("groupA1.json", "强条 mp_001–011（A1 组）所需切片"),
-                      ("groupA2.json", "常见设计问题 ci_*（A2 组）所需切片")):
+    for name, gkey, doc in (("groupA1.json", "A1", "强条 mp_001–011（A1 组）所需切片"),
+                            ("groupA2.json", "A2", "常见设计问题 ci_*（A2 组）所需切片")):
         data = dict(data_a)
         data["_doc"] = doc
-        p = os.path.join(out_dir, name)
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
-        size_kb = os.path.getsize(p) / 1024
-        print(f"[slice] {name}: {size_kb:.1f} KB")
+        data["requirements"] = reqs_by_group[gkey]
+        _write_slice(out_dir, name, data, len(reqs_by_group[gkey]))
 
-    p = os.path.join(out_dir, "groupD.json")
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(groupD, f, ensure_ascii=False, indent=1)
-    size_kb = os.path.getsize(p) / 1024
-    print(f"[slice] groupD.json: {size_kb:.1f} KB")
+    groupD = build_groupD(run_dir, here)
+    groupD["requirements"] = reqs_by_group["D"]
+    _write_slice(out_dir, "groupD.json", groupD, len(reqs_by_group["D"]))
 
-    print(f"[slice_artifacts] 5 个切片已生成到 {out_dir}")
+    print(f"[slice_artifacts] 5 个切片已生成到 {out_dir}"
+          f"（内嵌要求清单 {sum(len(v) for k, v in reqs_by_group.items())} 条 + det 直出 "
+          f"{len(DET_DIRECT_IDS)} 条 = 全覆盖）")
 
 
 if __name__ == "__main__":

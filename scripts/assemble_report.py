@@ -20,6 +20,13 @@ import json
 import os
 import re
 import sys
+
+# GBK 控制台自愈：打印 ✓/✗ 等会 UnicodeEncodeError 且产物不落盘（2026-09-30 实测）
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(errors="replace")
+    except Exception:
+        pass
 from collections import OrderedDict
 
 VERDICTS = ["符合", "部分符合", "不符合", "不适用", "未检出"]

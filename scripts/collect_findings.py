@@ -17,11 +17,15 @@ findings.json，消除历史上"主 agent 现场拼 build_findings.py/_merge.py"
   - issues 元素保留 loc/original/type/suggestion；evidence 元素保留 loc/quote
   - det_findings 的同 id 结果覆盖 subagent 结果（det 优先）
 
-覆盖率：对照 requirements.json 全部 42 条；缺失 id 打印 warning（不阻断），
-        缺失条目按"未检出"占位，确保下游 assemble_report 42 条全覆盖。
+覆盖率（硬门禁，2026-10-01 起）：对照 requirements.json 全部 42 条；仍有缺失时
+        findings.json 照写（缺失条目按"未检出"占位、_source=missing），但打印 FAIL
+        并以退出码 1 结束——占位 ≠ 完成，须按 SKILL.md ③ 的失败恢复三梯度补齐后
+        重跑本脚本，不得带占位进入合成。确属无法补判时加 --allow-missing 放行
+        （最终报告须向用户说明）。背景：2026-09-30 实战曾因手抄下发清单漏发 3 条
+        ci_*，靠人工汇总校验才兜住——静默占位会掩盖这类丢失。
 
 用法：
-  python collect_findings.py <run_dir> [--from <subagent产物目录>]
+  python collect_findings.py <run_dir> [--from <subagent产物目录>] [--allow-missing]
 """
 
 from __future__ import annotations
@@ -29,6 +33,15 @@ import argparse
 import json
 import os
 import sys
+
+
+def _console_safe():
+    # GBK 控制台下打印 ✓/✗ 会 UnicodeEncodeError 且产物不落盘，errors=replace 自愈
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(errors="replace")
+        except Exception:
+            pass
 
 
 VERDICTS = {"符合", "部分符合", "不符合", "不适用"}
@@ -139,10 +152,13 @@ def _load_group_files(run_dir, from_dir):
 
 
 def main():
+    _console_safe()
     ap = argparse.ArgumentParser(description="收集并合并 subagent 产物 + det_findings")
     ap.add_argument("run_dir", help="运行产物目录")
     ap.add_argument("--from", dest="from_dir", default=None,
                     help="subagent 产物所在子目录（默认 run_dir）")
+    ap.add_argument("--allow-missing", action="store_true",
+                    help="确属无法补判时放行占位条目（最终报告须向用户说明）")
     args = ap.parse_args()
 
     run_dir = args.run_dir
@@ -221,7 +237,7 @@ def main():
     if overridden:
         print(f"[collect] det 覆盖 subagent: {overridden}")
     if missing:
-        print(f"[collect] ⚠ 缺失 {len(missing)} 条（按“未检出”占位）: {missing}")
+        print(f"[collect] 缺失 {len(missing)} 条（先按“未检出”占位写入，文末门禁）: {missing}")
     else:
         print(f"[collect] ✓ 42 条全覆盖")
 
@@ -246,6 +262,20 @@ def main():
         dist[v] = dist.get(v, 0) + 1
     print(f"[collect] 分布: {dist}")
     print(f"[collect] 已生成 {out_path}（{len(merged)} 条）")
+
+    # 覆盖硬门禁：占位 ≠ 完成（2026-09-30 实战漏 3 条 ci_* 的教训）
+    if missing:
+        print()
+        print(f"[collect] ✗ FAIL：仍有 {len(missing)} 条为占位（未检出/_source=missing）: {missing}")
+        print("[collect] 按 SKILL.md ③ 失败恢复三梯度补齐后重跑 collect：")
+        print("[collect]   1) 对失败运行 resume 收尾模式，用 json_append.py 补写缺条；")
+        print("[collect]   2) 主会话 Grep 定点补判，写 groupXb.json（本脚本自动收集）；")
+        print("[collect]   3) 前两步无效才重发更小任务（≤6 条/组）。")
+        if args.allow_missing:
+            print("[collect] --allow-missing 已指定：放行（最终报告须向用户说明未检出条目）")
+        else:
+            print("[collect] 确属无法补判时可用 --allow-missing 放行。")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

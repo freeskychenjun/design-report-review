@@ -27,6 +27,13 @@ import os
 import re
 import sys
 
+# GBK 控制台自愈：打印 ✓/✗ 等会 UnicodeEncodeError 且产物不落盘（2026-09-30 实测）
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 
 # ============================================================
 # 黑话 → 人话 替换表（按长度降序处理，避免短串误伤长串）

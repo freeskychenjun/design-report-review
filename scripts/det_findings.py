@@ -26,6 +26,13 @@ import json
 import os
 import sys
 
+# GBK 控制台自愈：打印 ✓/✗ 等会 UnicodeEncodeError 且产物不落盘（2026-09-30 实测）
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 # 直出条目 id → requirements.json 里的 name（启动时从 requirements.json 校准）
 DET_IDS = ["std_001", "std_003", "std_004", "gram_007"]
 

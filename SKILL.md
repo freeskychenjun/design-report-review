@@ -15,7 +15,7 @@ description: 对水利工程设计报告（Word .docx/.doc）进行智能校审�
 
 - 技能根目录（下称 `$SKILL`）= 本 SKILL.md 所在目录。
 - 依赖：Python 3 + `python-docx`、`lxml`（已随环境安装）。Windows 下 `.doc` 转换可选依赖 LibreOffice 或 pywin32。
-- 关键脚本：`$SKILL/scripts/` 下的 `extract_docx.py`、`deterministic_checks.py`、`slice_artifacts.py`、`det_findings.py`、`collect_findings.py`、`assemble_report.py`、`page_map.py`、`maintain.py`。
+- 关键脚本：`$SKILL/scripts/` 下的 `extract_docx.py`、`deterministic_checks.py`、`slice_artifacts.py`、`det_findings.py`、`collect_findings.py`、`assemble_report.py`、`page_map.py`、`maintain.py`、`json_append.py`（subagent 增量写盘助手）。
 - 参考/索引（首次运行自动生成）：`$SKILL/scripts/references_index.json`、`$SKILL/scripts/requirements.json`。
 - 运行产物目录：`$SKILL/_run/<文档名去后缀>/`。
 
@@ -41,12 +41,12 @@ artifacts: fulltext.md / tables.json / captions.json / citations.json / numbers.
    │  ②c 直出4条结论     det_findings.py           【新】
    ▼
 _slices/groupA1/A2/B/C/D.json（裁剪后小文件） + det_findings.json（std_001/003/004、gram_007）
-   │  ③ 并行语义检查（5 组 subagent，每组只读对应 _slices/ 组切片；同时后台跑 ①b）
+   │  ③ 并行语义检查（5 组 subagent，每组只读对应 _slices/ 组切片；增量写盘；同时后台跑 ①b）
    ▼
-各 subagent 写 groupX.json 到 <run_dir>/（按 schema）
+各 subagent 增量写 groupX.json（骨架先行、每判完 1 条立即追加）
    │  ④ 收集+合并+校验   collect_findings.py       【新】
    ▼
-findings.json（42 条全覆盖；det 覆盖 subagent；缺失败占位"未检出"）
+findings.json（42 条全覆盖；det 覆盖 subagent；仍有缺失 → 退出码 1 硬门禁，占位 ≠ 完成）
    │  ④b 结论润色         polish_findings.py        【新】去除机器字段名
    ▼
 findings.json（机器黑话已翻译为自然语言）
@@ -81,6 +81,8 @@ python "$SKILL/scripts/slice_artifacts.py" "$SKILL/_run/<文档名>"
 ```
 按 5 个分组裁剪产物，生成 `_slices/groupA1/A2/B/C/D.json`（大报告会自动限量：表格只给有问题的+采样、numbers 只给 moduli/flows、references_index 只给命中项、全文按疑点关键词裁剪）。**A1（强条 mp，11 条）与 A2（常见 ci，9 条）共用同一份 A 数据切片**——内容与拆分前 groupA 完全一致，仅提示词中要求清单不同；拆组只为把原 20 条最重组的负载减半，不丢任何证据。**subagent 只读切片，不再灌全文。**
 
+每个切片内嵌 `"requirements"` 字段（本组各条的 id/name/content 原文，程序化取自 requirements.json）——**下发提示词直接引用切片内清单，禁止手抄要求清单**（2026-09-30 实战曾因手抄漏发 ci_runoff_002/ci_water_002/ci_water_003 共 3 条）。生成前做**分组覆盖自检**：5 组清单 ∪ det 直出 4 条 ≠ 全部要求即报错退出，分组定义与要求清单漂移当场拦截。
+
 ### ②c 直出 4 条结论（提质 + 提速核心）
 ```bash
 python "$SKILL/scripts/det_findings.py" "$SKILL/_run/<文档名>"
@@ -113,11 +115,18 @@ python "$SKILL/scripts/det_findings.py" "$SKILL/_run/<文档名>"
 > **半直出条目**（tbl_001/ds_001/ds_002/lr_001/lr_002）：det 硬证据已在切片内，subagent 直接引用 det 结论，不重复核算。
 > **大报告**：groupC 切片会提示"用 Grep 分段读 fulltext.md"检查标点/错字，勿一次性读全文。
 
-### ④ 收集+合并+校验
+**验收标准（completed ≠ 成功）**：一个组"完成"的唯一定义是——`group<X>.json` 存在、`python json_append.py <文件> verify` 通过、且 results 条数 ≥ 切片 requirements 字段的长度。运行界面显示 completed **不构成**完成依据：turn 结束但文件缺失或缺条目一律视为失败（2026-09-30 实战 B 组显示 completed 却没写文件）。
+
+**失败恢复三梯度（按序尝试，成本递增；2026-09-30 实战 6/6 靠梯度 1 收齐）**：
+1. **resume 收尾模式**：对失败/超时的运行直接 resume（恢复自带已积累的分析上下文，成本最低），指令改为收尾模式——禁止再做新的系统性检索/阅读；已分析未写盘的条目立即用 json_append.py 补写；未分析完的条目最多 ≤3 处定点读取后给简短判定；verify 通过后立即结束。
+2. **主会话定点补判**：仍缺的条目由主会话在 fulltext.md 定点 Grep 检索关键词后，用 json_append.py 写入 `group<X>b.json`（collect 自动收集 run_dir 下任意 `group*.json`，拆分命名无需适配）。
+3. **重发更小任务**：前两梯度无效才重新派发，且必须进一步拆小（≤6 条/组，见 §5 拆分预案）。
+
+### ④ 收集+合并+校验（覆盖硬门禁）
 ```bash
 python "$SKILL/scripts/collect_findings.py" "$SKILL/_run/<文档名>"
 ```
-收集 4 个 subagent 的 groupX.json + det_findings.json，校验字段、**det 覆盖同 id 的 subagent 结果**、对照 requirements.json 确保 42 条全覆盖（缺失按"未检出"占位），输出 `findings.json`。
+收集 5 组 subagent 的 groupX.json + det_findings.json，校验字段、**det 覆盖同 id 的 subagent 结果**、对照 requirements.json 确保 42 条全覆盖。**全覆盖是硬门禁**：仍有缺失时 findings.json 照写（缺失条目按"未检出"占位、`_source=missing`），但脚本**打印 FAIL 并以退出码 1 结束**——占位 ≠ 完成，须按 ③ 的失败恢复三梯度补齐后重跑 collect，不得带占位进入 ⑤；确属无法补判时加 `--allow-missing` 放行（最终报告须向用户说明）。注意：退出码 1 是门禁信号不是脚本崩溃，先看输出再决定补判方式。
 
 ### ④b 结论润色（必跑）
 ```bash
@@ -146,7 +155,7 @@ python "$SKILL/scripts/assemble_report.py" "$SKILL/_run/<文档名>" [--format m
 - **det_numbering.json**：`{图/表:{count,formats,format_inconsistent,issues}}`。
 - **det_suspects.json**：`{summary, candidates:[{rule,loc,span,hint}]}`，错字词典+叠字/标点/配对/长句五类规则产的疑点候选（**只产候选不产结论**）。安徽两湖实测对 C 组金标准召回 28%，未接入切片（实验记录见 tests/README.md）。
 - **references/错字词典.json**：错字词典 76 条四级分档（挖掘自 414 份平台历史校审报告 + 20 个运行目录 + 行业补录），驱动 det_suspects 词典规则；增量维护用工作区 `词典/harvest_typos.py` 重跑。
-- **_slices/groupA..D.json**：按组裁剪的切片（见 ②b）。**subagent 的唯一输入**。
+- **_slices/groupA..D.json**：按组裁剪的切片（见 ②b），内嵌本组 `requirements` 要求清单。**subagent 的唯一输入**。
 - **det_findings.json**：4 条直出结论（std_001/003/004、gram_007），格式同 findings.json 子集。
 - **references_index.json**：标准/法规按 `norm_code`、`norm_name`、`prefix_num` 检索（切片已含命中项，subagent 不直接读全索引）。
 - **requirements.json**：`[{category,subcategory,id,name,content}]`（42 条）。
@@ -162,7 +171,9 @@ python "$SKILL/scripts/assemble_report.py" "$SKILL/_run/<文档名>" [--format m
 只使用我提供的切片数据 与（必要时 Grep 读取的）文档原文，禁止臆测；每条结论必须给出文档中的定位(段落号 PXXXX / 表号 / 题录)与原文片段作为依据。
 
 【本组检查要求】（必须全部覆盖，逐条响应）：
-<粘贴 requirements.json 中本组各条 的 id/name/content 原文>
+以切片文件内的 "requirements" 字段为准（本组各条的 id/name/content 原文，共 N 条）——
+以下发的切片为准、不得增删、不得凭记忆另写清单（2026-09-30 实战曾因手抄清单漏发 3 条）。
+仅当切片为不含 requirements 字段的旧版时，才从 requirements.json 粘贴本组各条原文。
 
 【唯一输入】读取这一个文件（含本组所需的裁剪后全文/表格/数值/det 证据）：
 $SKILL/_run/<文档名>/_slices/group<X>.json
@@ -196,15 +207,26 @@ $SKILL/_run/<文档名>/_slices/group<X>.json
 【大报告提示】若切片含 _fulltext_note（全文过大），gram_001–006（标点/错字/通顺）请用 Grep 在
 <run_dir>/fulltext.md 按段落号区间分段（如 P0000–P0500）逐段读取检查，每段报具体 loc+original+suggestion。
 
-【输出】严格输出 JSON（仅 JSON），保存到 $SKILL/_run/<文档名>/group<X>.json：
-{"category":"<组名>","results":[
+【输出——增量写盘纪律（严格遵守；运行可能中途被截断/超时，2026-09-30 实测）】
+输出文件：$SKILL/_run/<文档名>/group<X>.json，逐条 result 结构：
   {"id":"<编号>","name":"<名称>","verdict":"符合|部分符合|不符合|不适用",
    "conclusion":"<结论，含主要分析>","evidence":[{"loc":"<定位>","quote":"<原文片段>"}],
    "issues":[{"loc":"P0238","original":"…","type":"叠字","suggestion":"…"}]}
-]}
+1. 判定开始前先创建骨架（文件已存在会拒绝覆盖，保护可抢救成果）：
+   python "$SKILL/scripts/json_append.py" "$SKILL/_run/<文档名>/group<X>.json" init "<组名>"
+2. **每判定完 1 条，立即追加写入**（禁止攒到最后一次性写；禁止用 Edit 工具追加——
+   多行中文锚点必失配）。该条 JSON 用 heredoc 从 stdin 传入：
+   python "$SKILL/scripts/json_append.py" "$SKILL/_run/<文档名>/group<X>.json" <<'EOF'
+   {"id":"…","name":"…","verdict":"…","conclusion":"…","evidence":[…],"issues":[…]}
+   EOF
+   （运行中途死掉也不亏：已追加的条目都已落盘，恢复运行只补缺条。）
+3. 全部判完自检后立即结束：
+   python "$SKILL/scripts/json_append.py" "$SKILL/_run/<文档名>/group<X>.json" verify <本组条数>
+4. 除 group<X>.json 外**禁止创建/写入任何其他文件**（含临时文件与临时目录——首败根因
+   即子代理往不存在的 G:\tmp 写临时文件）；中间笔记一律并入 group<X>.json 的 conclusion。
 ```
 
-> 5 个 subagent 各写一个 `groupA1/A2/B/C/D.json`（category 取本组对应的检查类别名：A1="强制性条文检查"、A2="常见设计问题检查"；B 组的"一致性检查"+"表格逻辑关系专项检查"可拆成两个 results 数组或分两个文件，collect_findings 都能识别）。收齐后进入 ④。
+> 5 个 subagent 各写一个 `groupA1/A2/B/C/D.json`（category 取本组对应的检查类别名：A1="强制性条文检查"、A2="常见设计问题检查"；B 组的"一致性检查"+"表格逻辑关系专项检查"可拆成两个 results 数组或分两个文件，collect_findings 都能识别）。按 §5 拆分预案派发的小组写 `groupA1a/A1b/B1/B2/C1/C2.json` 等任意 `group*.json`，collect 自动收集。**收齐的判据是 ③ 的验收标准（文件存在 + verify 通过 + 条数齐），全部达标才进入 ④。**
 
 ### ⚠ 流程纪律（禁止现场拼脚本）
 
@@ -216,7 +238,7 @@ $SKILL/_run/<文档名>/_slices/group<X>.json
 
 ## 4. 报告输出格式（严格遵守"检查结果输出要求"）
 
-- 与要求**一一对应、不遗漏**：按 `requirements.json` 顺序，42 条全部出现；collect_findings 已确保全覆盖。
+- 与要求**一一对应、不遗漏**：按 `requirements.json` 顺序，42 条全部出现；collect_findings 的覆盖硬门禁保证（缺条=FAIL 退出码 1，占位条目不得带入报告）。
 - **引用完整要求原文**：每条在结论前以引用块给出该条要求全文（取自 requirements.json 的 content；强制性条文条目含规范条款原文）。
 - 即便符合，也写"主要分析结论"。
 - **默认输出 HTML**，保存到**输入文档同目录**：`<文档名>_校审报告.html`（**仪表板式**：顶部横幅 + 左侧目录(滚动高亮) + KPI 统计卡(总数/符合/存在问题/符合率) + 问题筛选(全部/仅存在问题/仅不符合) + 按类别表格化结论(列：检查项｜要求｜检查结果｜说明/建议，每条一行、行级配色 绿/橙/红/灰、有问题内容红色粗体)，说明/建议列只给结论与建议（不单列定位依据引用），浏览器直接打开/归档、支持打印）。
@@ -260,6 +282,7 @@ $SKILL/_run/<文档名>/_slices/group<X>.json
 ## 5. 效率与降级
 
 - **首选 5 组并行**：在**一条消息内**同时发起 5 个 subagent（A1/A2/B/C/D），墙钟≈最慢一组；原 A 组（20 条最重）已拆为 A1（11 条）+A2（9 条），共用同一数据切片，负载均衡且证据不缩水。
+- **组规模与拆分预案（≤6 条/组最稳）**：实测（2026-09-30，glm-5.3-flash + 214 页报告）11 条的 A1、8 条的 C 在单次运行内必死于输出超长/30 分钟超时；6 条左右的小组配合增量写盘全部可收齐。**模型较弱（flash 级）或文档很大（>1500 段或切片 >150KB）时，把标准 5 组拆成 8 组**：A1→A1a（mp_001~006）+A1b（mp_007~011）、B→B1（cons_001~003）+B2（tbl_001~003）、C→C1（gram_001~004）+C2（gram_005/006/008/std_002）。拆分后各小组写 `groupA1a.json` 等任意 `group*.json`（collect 自动收集），**切片不用重切——同组拆分共用原切片**（A1a/A1b 都读 groupA1.json，B1/B2 读 groupB.json，C1/C2 读 groupC.json），要求清单以切片 requirements 中各自负责的条目为准。
 - **page_map 后台并行**：①b（Word 分页约 1~2 分钟）只被 ⑤ 使用，与 ③ 同时后台执行，不占墙钟。
 - **切片已限量**：subagent 无需自行判断读什么。
 - **大报告**：groupC 切片会提示用 Grep 分段读 fulltext.md 查标点/错字；groupB 表格只给有问题的+采样。
