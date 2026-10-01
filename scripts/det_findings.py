@@ -70,24 +70,36 @@ def build_std_001(det_numbers, names):
     bu = det_numbers.get("std001_bigunit", {})
     mixed = bu.get("mixed_form", False)
     word_forms = bu.get("word_forms", {})
-    pow10_count = bu.get("pow10_count", 0)
+    hits = bu.get("pow10_hits", [])
 
     if not mixed:
         wf = "、".join(f"{k}({v}处)" for k, v in word_forms.items()) if word_forms else "无"
-        conclusion = (f"检查大数单位使用：文字单位 {wf}；10的次方形式 {pow10_count} 处。"
+        conclusion = (f"检查大数单位使用：文字单位 {wf}；10的次方形式 {len(hits)} 处。"
                       f"未发现文字单位与10的次方形式混用，符合规范。")
         return _result("std_001", names, "符合", conclusion)
 
-    # mixed_form=true：存在混用
-    conclusion = (f"检查大数单位使用：文字单位 {word_forms}（共 "
-                  f"{sum(word_forms.values())} 处）与 10的次方形式（{pow10_count} 处）"
-                  "混用，违反“同一本报告中只能采用一种形式”的要求。")
-    issues = [{
-        "loc": "全文",
-        "original": f"同时使用文字单位({word_forms})与10的次方形式({pow10_count}处)",
-        "type": "单位混用",
-        "suggestion": "统一为一种形式（建议统一用亿/万等文字单位，或统一用10的N次方）",
-    }]
+    # mixed_form=true：存在混用——逐处列出 10的次方写法（含 ×10N 平文写法）
+    issues = []
+    for v in hits:
+        loc = v.get("loc", "") or "全文"
+        val = v.get("value", "")
+        mant = v.get("mantissa", "")
+        cn = v.get("cn_unit", "")
+        if mant:
+            sug = f"{val} → {mant}{cn}（如 0.27×104 → 0.27万）"
+        else:
+            sug = f"{val} → 统一改为文字单位（10的{v.get('exp')}次方 = {cn}）"
+        issues.append({
+            "loc": loc,
+            "original": f"{val}（{v.get('context', '')[:60]}）",
+            "type": "单位混用",
+            "suggestion": sug,
+        })
+    wf = "、".join(f"{k}({v}处)" for k, v in word_forms.items())
+    conclusion = (f"检查大数单位使用：文字单位 {wf}（共 {sum(word_forms.values())} 处）"
+                  f"与 10的次方形式（{len(hits)} 处，含 ×10N 平文写法）混用，"
+                  "违反“同一本报告中只能采用一种形式”。因全文文字单位占绝对多数，"
+                  "建议把 10的次方形式逐处换算为文字单位（×10⁴＝万、×10⁸＝亿），数值不变。")
     return _result("std_001", names, "不符合", conclusion, issues)
 
 
@@ -101,9 +113,10 @@ def build_std_003(det_numbers, names):
     n_v = len(violations)
 
     if n_v == 0:
-        info_note = f"；另有 {len(info)} 处整数流量不足3位有效数字（设计流量常为整数，结合语境判断，不判违规）" if info else ""
-        conclusion = (f"检查流量数值有效数字：未发现>3位有效数字或小数>3位的违规。"
-                      f"{info_note}")
+        info_note = (f"，另有 {len(info)} 处整数流量不足3位有效数字"
+                     f"（设计流量常为整数，结合语境判断，不判违规）") if info else ""
+        conclusion = (f"检查流量数值有效数字：未发现>3位有效数字或小数>3位的违规"
+                      f"{info_note}。")
         return _result("std_003", names, "符合", conclusion)
 
     # 有违规：逐条生成 issue（value→suggested）
@@ -133,32 +146,31 @@ def build_std_003(det_numbers, names):
 
 # ============================================================
 # std_004 工程等别/级别罗马-阿拉伯：findings 里存在 issue 项
+# 判定尺度（2026-10-01）：个别笔误（≤3 处）→ 部分符合；成片误用（>3 处）→ 不符合
 # ============================================================
 def build_std_004(det_numbers, names):
     grades = det_numbers.get("std004_grade", [])
     issues_found = [g for g in grades if not g.get("ok") and g.get("issue")]
 
     if not issues_found:
-        n_checked = len(grades)
-        conclusion = (f"检查工程等别/级别数字书写：扫描到 {n_checked} 处“等别/级别”表述，"
-                      "未发现罗马数字与阿拉伯数字误用。")
+        conclusion = ("检查工程等别/级别数字书写：未发现罗马数字与阿拉伯数字误用，"
+                      "也未发现拉丁字母 I/V/X 冒充罗马数字的写法。")
         return _result("std_004", names, "符合", conclusion)
 
     issues = []
     for g in issues_found:
-        loc = g.get("loc", "")
-        rule = g.get("rule", "")
-        issue = g.get("issue", "")
-        expect = g.get("expect", "")
         issues.append({
-            "loc": "全文（搜索匹配）",
-            "original": loc,
+            "loc": g.get("loc", "") or "全文（搜索匹配）",
+            "original": g.get("raw", "") or g.get("loc", ""),
             "type": "数字形式",
-            "suggestion": f"{rule}：{issue}，应改为{expect}",
+            "suggestion": f"{g.get('rule', '')}：{g.get('issue', '')}，应改为{g.get('expect', '')}",
         })
-    conclusion = (f"检查工程等别/级别数字书写：发现 {len(issues_found)} 处"
-                  f"罗马数字与阿拉伯数字误用（等别应为罗马Ⅰ~Ⅴ，建筑物级别应为阿拉伯1~5）。")
-    return _result("std_004", names, "不符合", conclusion, issues)
+    verdict = "部分符合" if len(issues_found) <= 3 else "不符合"
+    conclusion = (f"检查工程等别/级别数字书写：发现 {len(issues_found)} 处罗马/阿拉伯"
+                  f"数字书写问题（等别/航道等级/围岩及水质类别应为罗马数字Ⅰ~Ⅶ，"
+                  "建筑物及堤防级别应为阿拉伯数字1~5，罗马数字须用专用字符而非拉丁字母I/V/X）。"
+                  "逐处见问题清单，多数表述经扫描未见误用。")
+    return _result("std_004", names, verdict, conclusion, issues)
 
 
 # ============================================================

@@ -91,9 +91,9 @@ python "$SKILL/scripts/det_findings.py" "$SKILL/_run/<文档名>"
 
 | id | 判定规则（来自 det_*.json） |
 |---|---|
-| std_001 | `std001_bigunit.mixed_form`：文字单位与10的次方混用→不符合 |
+| std_001 | `std001_bigunit.mixed_form`：文字单位与10的次方混用→不符合（10的次方含"×10N"平文写法，直接扫全文，2026-10-01 修召回） |
 | std_003 | `std003_flow.violations`：>3位有效数字或小数>3位→不符合 |
-| std_004 | `std004_grade`：存在 issue（罗马/阿拉伯误用）→不符合 |
+| std_004 | `std004_grade`：等别/航道等级/围岩及水质类别应为罗马专用字符、建筑物及堤防级别应为阿拉伯数字，另收拉丁字母 I/V/X 冒充罗马数字（如"III等"）。0 处→符合；1~3 处→部分符合；>3 处→不符合 |
 | gram_007 | `det_numbering`：重复/断号→不符合；仅格式不统一→部分符合 |
 
 > 理由：这些是数数/查表/加法，脚本比 LLM 更准（实测 std_003 脚本抓 23 处 vs LLM 15 处）。SKILL 设计原则"宁可漏报也不误报"，det 给的 fail 是高置信硬伤。

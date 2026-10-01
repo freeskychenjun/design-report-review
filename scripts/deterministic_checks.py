@@ -451,7 +451,6 @@ def check_numbers(numbers, fulltext):
 
     # std_001 大数单位：仅在"文字单位"与"10的N次方"两种形式混用时才算违规
     bigunits = [n for n in numbers if n["key"] == "bigunits"]
-    pow10 = [n for n in numbers if n["key"] == "pow10"]
     bu_count = defaultdict(int)
     for n in bigunits:
         m = re.search(r"(亿|万|百万)", n["raw"])
@@ -459,36 +458,115 @@ def check_numbers(numbers, fulltext):
             bu_count[m.group(1)] += 1
     word_forms = {k: v for k, v in bu_count.items() if v > 0}
     has_word = len(word_forms) > 0
-    has_pow10 = len(pow10) > 0
+    # 10的次方形式直接扫全文（2026-10-01 修：extract 的 pow10 分类只认"10的N次方"
+    # 字面文本，漏掉"×104"平文写法——山许实测漏 25 处导致 std_001 误判符合）
+    pow10_hits = _scan_pow10(fulltext)
+    has_pow10 = len(pow10_hits) > 0
     std001_mixed = has_word and has_pow10  # 同一报告只能用一种"形式"（文字 vs 10的次方）
 
     return {
         "std003_flow": {"violations": flow_violations, "info": flow_info,
                         "n_violations": len(flow_violations)},
-        "std001_bigunit": {"word_forms": word_forms, "pow10_count": len(pow10),
+        "std001_bigunit": {"word_forms": word_forms, "pow10_count": len(pow10_hits),
+                           "pow10_hits": pow10_hits,
                            "mixed_form": std001_mixed,
                            "note": "亿/百万/万属同一(文字)形式可并用；仅当与'10的N次方'混用时违规"},
         "std004_grade": _check_grade(fulltext),
     }
 
 
+# ×10N 平文写法（如 0.27×104t）：Word 上标丢失后即为该形式，与文字单位混用时违规。
+# 指数限定 3~12（"50×100"之类量纲乘积、页码编号不误收）；同时收"10的N次方"字面写法。
+POW10_CN = {3: "千", 4: "万", 5: "十万", 6: "百万", 7: "千万", 8: "亿",
+            9: "十亿", 10: "百亿", 11: "千亿", 12: "万亿"}
+
+
+def _scan_pow10(fulltext):
+    hits = []
+    pat_x = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*[×x*]\s*10(\d{1,2})(?![\d.])")
+    pat_txt = re.compile(r"10\s*的\s*(\d{1,2})\s*次方")
+    for line in fulltext.splitlines():
+        mloc = re.match(r"\s*(P\d+)", line)
+        loc = mloc.group(1) if mloc else ""
+        for m in pat_x.finditer(line):
+            exp = int(m.group(2))
+            if exp not in POW10_CN:
+                continue
+            s, e = m.span()
+            hits.append({"value": re.sub(r"\s+", "", m.group(0)),
+                         "mantissa": m.group(1), "exp": exp, "cn_unit": POW10_CN[exp],
+                         "context": line[max(0, s - 25):min(len(line), e + 25)].strip(),
+                         "loc": loc})
+        for m in pat_txt.finditer(line):
+            exp = int(m.group(1))
+            if exp not in POW10_CN:
+                continue
+            s, e = m.span()
+            hits.append({"value": re.sub(r"\s+", "", m.group(0)),
+                         "mantissa": "", "exp": exp, "cn_unit": POW10_CN[exp],
+                         "context": line[max(0, s - 20):min(len(line), e + 20)].strip(),
+                         "loc": loc})
+    return hits
+
+
 def _check_grade(fulltext):
+    """std_004 等别/级别数字书写。按行扫描便于给出 P 段落定位；规则力求高精度：
+    等别/航道等级/围岩类别/水质类别=罗马数字专用字符，建筑物级别=阿拉伯数字。
+    2026-10-01 扩充：原版只认"工程等别/建筑物级别"紧邻窗口，漏掉"III等"（拉丁字母
+    冒充罗马数字，山许 P0285 实例）等情形。"""
     findings = []
-    for m in re.finditer(r"(枢纽工程|工程)等别[^，。；\n]{0,18}", fulltext):
-        seg = m.group(0)
-        has_roman = bool(re.search(r"[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]", seg))
-        arabic = re.findall(r"[1-7]", seg)
-        if arabic and not has_roman:
-            findings.append({"rule": "工程等别应为罗马数字(Ⅰ~Ⅴ)", "loc": seg,
-                             "issue": f"出现阿拉伯数字 {arabic}", "expect": "罗马数字"})
-        elif has_roman:
-            findings.append({"rule": "工程等别应为罗马数字", "loc": seg, "ok": True})
-    for m in re.finditer(r"(主要建筑物|次要建筑物|水工建筑物|建筑物)级别[^，。；\n]{0,12}", fulltext):
-        seg = m.group(0)
-        roman = re.findall(r"[ⅠⅡⅢⅣⅤⅥⅦ]", seg)
-        if roman:
-            findings.append({"rule": "建筑物级别应为阿拉伯数字(1~5)", "loc": seg,
-                             "issue": f"出现罗马数字 {roman}", "expect": "阿拉伯数字"})
+
+    # 拉丁字母 I/V/X 序列冒充罗马数字（"III等"应为"Ⅲ等"；单字母不收——"V型""X型"合法）
+    pat_fake_roman = re.compile(r"(?<![A-Za-z])([IVX]{2,4})(?=[等级类型])")
+    # 建筑物/堤防级别误用罗马数字（"Ⅲ级堤防"应为"3级堤防"；阶地/航道用罗马属正确，不收）
+    pat_roman_grade = re.compile(r"([ⅠⅡⅢⅣⅤⅥⅦ])\s*级(?=[建筑物堤防])")
+    # 围岩/地表水/水质类别误用阿拉伯数字（"地表水3类"应为"Ⅲ类"）
+    pat_arabic_class = re.compile(r"(围岩|地表水|水质|水环境)[^，。；\n]{0,6}?([1-5])\s*类")
+    # 航道/船闸等级误用阿拉伯数字（"3级航道"应为"Ⅲ级航道"）
+    pat_arabic_channel = re.compile(r"(?:[1-7])\s*级(?=航道|船闸)")
+
+    for line in fulltext.splitlines():
+        mloc = re.match(r"\s*(P\d+)", line)
+        loc = mloc.group(1) if mloc else ""
+        for m in re.finditer(r"(枢纽工程|工程)等别[^，。；\n]{0,18}", line):
+            seg = m.group(0)
+            has_roman = bool(re.search(r"[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]", seg))
+            arabic = re.findall(r"[1-7]", seg)
+            if arabic and not has_roman:
+                findings.append({"rule": "工程等别应为罗马数字(Ⅰ~Ⅴ)", "loc": loc,
+                                 "raw": seg, "issue": f"出现阿拉伯数字 {arabic}",
+                                 "expect": "罗马数字"})
+        for m in re.finditer(r"(主要建筑物|次要建筑物|水工建筑物|建筑物|堤防)级别[^，。；\n]{0,12}", line):
+            seg = m.group(0)
+            roman = re.findall(r"[ⅠⅡⅢⅣⅤⅥⅦ]", seg)
+            if roman:
+                findings.append({"rule": "建筑物级别应为阿拉伯数字(1~5)", "loc": loc,
+                                 "raw": seg, "issue": f"出现罗马数字 {roman}",
+                                 "expect": "阿拉伯数字"})
+        for m in pat_fake_roman.finditer(line):
+            s = m.start()
+            findings.append({"rule": "罗马数字应为专用字符(Ⅰ~Ⅻ)，非拉丁字母I/V/X",
+                             "loc": loc, "raw": line[max(0, s - 15):s + 20].strip(),
+                             "issue": f"拉丁字母 {m.group(1)} 冒充罗马数字",
+                             "expect": "对应专用罗马数字字符"})
+        for m in pat_roman_grade.finditer(line):
+            s = m.start()
+            findings.append({"rule": "建筑物/堤防级别应为阿拉伯数字(1~5)",
+                             "loc": loc, "raw": line[max(0, s - 15):s + 20].strip(),
+                             "issue": f"罗马数字 {m.group(1)} 用于级别",
+                             "expect": "阿拉伯数字"})
+        for m in pat_arabic_class.finditer(line):
+            s = m.start()
+            findings.append({"rule": f"{m.group(1)}类别应为罗马数字(Ⅰ~Ⅴ)",
+                             "loc": loc, "raw": line[max(0, s - 15):s + 20].strip(),
+                             "issue": f"出现阿拉伯数字 {m.group(2)}",
+                             "expect": "罗马数字"})
+        for m in pat_arabic_channel.finditer(line):
+            s = m.start()
+            findings.append({"rule": "航道/船闸等级应为罗马数字(Ⅰ~Ⅶ)",
+                             "loc": loc, "raw": line[max(0, s - 15):s + 20].strip(),
+                             "issue": "阿拉伯数字用于航道/船闸等级",
+                             "expect": "罗马数字"})
     return findings
 
 
